@@ -1,28 +1,31 @@
 import AppKit
 import ApplicationServices
+import QuartzCore
 
 // TileProto: 自动平铺原型 v5（面板版）
 // v5：纯文字 NSMenu 换成菜单栏面板（NSPopover），平铺引擎不动。
 // 菜单栏常驻；监听窗口集合变化（打开/关闭/最小化），自动按布局平铺主屏窗口。
 // 原理：Accessibility API（AXUIElement）枚举窗口 + 改位置大小。
 // 行为模型（全部自行实现）：
-//  1. 四种布局 Grid/Columns/Rows/Side，各有磁贴容量（4/3/2/3）；
-//     磁贴上限 1-4 与布局容量、窗口数取 min 得实际磁贴数；1 磁贴 = 全屏。
-//  2. 堆叠：窗口数超过磁贴数时，多余窗口堆进活动磁贴（最前窗口所在磁贴，
-//     最前窗口不在磁贴内时堆进第 0 个磁贴）；同磁贴窗口共享同一 frame，
-//     菜单“磁贴内下一个/上一个窗口”轮换栈顶并激活新栈顶。
+//  1. 四种布局 Grid/Columns/Rows/Side。每块屏能放下的磁贴数看可见区域：
+//     Grid 恒为 4；MacBook 级屏幕 Columns 3、Rows 2、Side 3；更宽更高再加。
+//     磁贴上限 1-4 与这块屏的容量、窗口数取 min；1 磁贴 = 真全屏（不留边）。
+//  2. 堆叠：窗口数超过磁贴数时，多余窗口堆进活动磁贴；⌃⌘ 拖到某磁贴上时，
+//     即使刚好满格，被拖窗口也并进该磁贴，原格子收掉并重排。同磁贴共享 frame。
+//     橙色握把或 ⌃⌥` 轮换栈顶并激活。
 //  3. 主窗口尺寸 Half/60%/Two-thirds，作用于 Grid（3 磁贴）与 Side 的主窗口宽度。
 //  4. 间距 4/8/16 pt，作用于窗口间与屏幕边缘。
-//  5. Focus 模式：非最前窗口移出屏外（x=-10000，保持尺寸），最前窗口占满
-//     visibleFrame；期间自动平铺暂停；关闭时恢复记录的 frame 并恢复自动平铺。
+//  5. Focus 模式：活动窗口以短弹簧放大到 visibleFrame，其余窗口留在原位被盖住；
+//     再按一次从记录的 frame 精确缩回（含手动分隔比例）。
+//     Clean Space：其余窗口滑出屏外，活动窗口弹簧到屏幕中央，桌面铺深色，Dock 仍在。
 // v3 保留：防抖（变化稳定 2 周期才重排）、对话框类排除、按应用排除、
 // 自动平铺开关、立即平铺、授权指示（▦!）与重新请求权限、退出。
 // v6 新增（面板版之上，不动面板结构与平铺引擎主干）：
 //  悬停快捷条（窗口上沿 Primary / Focus / Float，轮询鼠标位置，无需新权限）；
 //  可拖分隔线（共享边上的自有小手柄，拖动改分割比例并记忆，面板可重置）；
 //  单窗口 Float（pid+标题跟踪）与恢复全部浮动窗口。
-// 高亮：活动窗口边框（Accent，3pt，画在间隙里，不压窗口内容）；
-// 暗色：非活动窗口 0.5 遮罩（No peek）。
+// 高亮：默认关（对齐 Shoji）。菜单 Borders 在无边框和活动窗口边框之间切换；
+// 暗色：非活动窗口 0.5 遮罩，淡入淡出（No peek）。布局移动走约 0.5s 的短弹簧。
 
 func log(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
@@ -257,7 +260,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var mainRatio: MainRatio = .half
     var gap: CGFloat = 8
     var focusMode = false
-    var focusSaved: [(element: AXUIElement, frame: CGRect)] = []
+    var focusSaved: [(element: AXUIElement, frame: CGRect, key: String)] = []
     var stackTops: [String: Int] = [:]  // C 批：key 为“屏ID:磁贴下标”，多屏不串位
     var lastSignature = ""
     var pendingSignature = ""
@@ -275,10 +278,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var layoutButtons: [DiagramButton] = []
     var countButtons: [DiagramButton] = []
     var countHintLabel: NSTextField!
+    var arrangementLabel: NSTextField!
+    var bordersButton: NSButton!
+    var hoverFocusButton: NSButton!
+    var tileAppLabel: NSTextField!
+    var tileAppSwitch: NSSwitch!
     var ratioSegment: NSSegmentedControl!
     var gapSegment: NSSegmentedControl!
     var focusButton: NSButton!
-    var cycleStackButton: NSButton!
     var shortcutsStatusLabel: NSTextField!
     var requestAXButton: NSButton!
     var lastPanelTilesKey = ""
@@ -314,11 +321,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var tapSource: CFRunLoopSource?
     var tapRunning = false
     var windowOrder: [String] = []
+    /// 手动堆叠：key 不占自己的磁贴，跟在 host 窗口所在的磁贴里。
+    /// 窗口数刚好等于上限时，⌃⌘ 拖上去也靠这张表并进目标磁贴，原格子收掉。
+    var stackedOnto: [String: String] = [:]
     var tabPanel: NSPanel?
     var tabRows: [(win: WinInfo, tile: Int, pos: Int, sid: CGDirectDisplayID)] = []
     var tabSelected = 0
     var tabRowViews: [TabRowView] = []
     var tabKeyMonitor: Any?
+    var tabFlagGlobal: Any?
+    var tabFlagLocal: Any?
+    var tabFrames: [String: CGRect] = [:]
+    var tabMinimap: TabMinimapView?
+    var tabTitleField: NSTextField?
+    var tabDetailField: NSTextField?
+    var tabMinField: NSTextField?
     // v8 状态：No peek / Clean Space（悬停激活已固定关、Dim 固定 0.5、Blur 固定关、背景固定 graphite）
     var noPeekOn = false
     var cleanSpaceOn = false
@@ -326,17 +343,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var dimPanels: [String: NSPanel] = [:]   // key：屏ID:磁贴下标，非活动磁贴各一层
     var lastActiveTile = 0
     var cleanBgPanel: NSPanel?
-    var cleanSaved: [(element: AXUIElement, frame: CGRect)] = []
+    var cleanSaved: [(element: AXUIElement, frame: CGRect, key: String)] = []
+    var tileHoldUntil: CFTimeInterval = 0
     var noPeekSwitch: NSSwitch!
     var cleanSpaceSwitch: NSSwitch!
-    // v9 状态：高亮固定活动边框 Accent 3pt（默认开，不再提供模式/粗细/颜色选择）
+    // 高亮：默认 None（与 Shoji 设置页一致）。菜单 Borders 在 None 与活动边框之间切换。
     enum HighlightMode: String, CaseIterable { case none, borderActive, borderAll, glow }
     enum HighlightColor: String, CaseIterable { case accent, purple, pink, orange, green, graphite }
-    var highlightMode: HighlightMode = .borderActive
+    var highlightMode: HighlightMode = .none
     var highlightThickness: CGFloat = 3
     var highlightColor: HighlightColor = .accent
+    var hoverActivate = false          // Hover focus：指针停在磁贴上才激活，默认关
+    var hoverActivateKey: String?
+    var hoverActivateSince: CFTimeInterval = 0
     var highlightPanels: [String: NSPanel] = [:]
-    // D 批状态：⌘拖交换 / ⌥⌘拖进堆叠
+    // D 批状态：⌘拖交换 / ⌃⌘拖进堆叠
     enum DragMode { case swap, stack }
     struct DragState {
         let mode: DragMode
@@ -358,6 +379,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var middleFloatOrder: [String] = []  // 居中浮动顺序：空位出现时最早的先回平铺
     var hoverBarOn = true                    // 悬停快捷条开关（默认开）
     var settingsWindow: NSWindow?
+    var settingsTabView: NSTabView?
     var appsTabStack: NSStackView?
     // B 批第二部分：Activity 统计（UserDefaults，bundle ID 不变则换二进制不丢数；
     // 只记数字与快捷键名，绝不记窗口标题与应用名）
@@ -672,6 +694,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stack.addArrangedSubview(w288(tilesStack))
         stack.addArrangedSubview(w288(tilesPlaceholder))
 
+        let captionRow = hRow()
+        let windowsLabel = sectionLabel("Windows on this screen")
+        windowsLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        arrangementLabel = NSTextField(labelWithString: "")
+        arrangementLabel.font = .systemFont(ofSize: 11)
+        arrangementLabel.textColor = .secondaryLabelColor
+        arrangementLabel.alignment = .right
+        arrangementLabel.lineBreakMode = .byTruncatingTail
+        let captionSpacer = NSView()
+        captionSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        captionRow.addArrangedSubview(windowsLabel)
+        captionRow.addArrangedSubview(captionSpacer)
+        captionRow.addArrangedSubview(arrangementLabel)
+        stack.addArrangedSubview(w288(captionRow))
+
         // C 批：屏幕选择器（多屏时出现，单屏隐藏；切换后布局/上限/尺寸/间距改的是该屏）
         let scrRow = hRow()
         let scrLabel = sectionLabel("屏幕")
@@ -732,7 +769,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let ratioRow = hRow()
         let ratioLabel = sectionLabel("主窗口尺寸")
         ratioLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        ratioSegment = NSSegmentedControl(labels: ["Half", "60%", "三分之二"], trackingMode: .selectOne, target: self, action: #selector(panelRatioChanged(_:)))
+        ratioSegment = NSSegmentedControl(labels: ["Half", "60%", "Two-thirds"], trackingMode: .selectOne, target: self, action: #selector(panelRatioChanged(_:)))
         ratioRow.addArrangedSubview(ratioLabel)
         ratioRow.addArrangedSubview(ratioSegment)
         stack.addArrangedSubview(w288(ratioRow))
@@ -745,18 +782,22 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stack.addArrangedSubview(w288(gapRow))
         stack.addArrangedSubview(w288(separator()))
 
-        // 动作按钮
+        // 与 Shoji 菜单同一排：Retile / Borders / Hover focus
         let actionRow = hRow(distribution: .fillEqually)
-        let tileNowBtn = NSButton(title: "立即平铺", target: self, action: #selector(panelTileNow(_:)))
-        focusButton = NSButton(title: "Focus 模式", target: self, action: #selector(panelToggleFocus(_:)))
-        cycleStackButton = NSButton(title: "堆叠切换", target: self, action: #selector(panelCycleNext(_:)))
-        for b in [tileNowBtn, focusButton!, cycleStackButton!] { actionRow.addArrangedSubview(b) }
+        let tileNowBtn = NSButton(title: "Retile", target: self, action: #selector(panelTileNow(_:)))
+        bordersButton = NSButton(title: "Borders", target: self, action: #selector(panelToggleBorders(_:)))
+        bordersButton.setButtonType(.pushOnPushOff)
+        hoverFocusButton = NSButton(title: "Hover focus", target: self, action: #selector(panelToggleHoverFocus(_:)))
+        hoverFocusButton.setButtonType(.pushOnPushOff)
+        for b in [tileNowBtn, bordersButton!, hoverFocusButton!] { actionRow.addArrangedSubview(b) }
         stack.addArrangedSubview(w288(actionRow))
 
         // v6 第二动作行：恢复浮动窗口、重置尺寸（上面已有行不动）
         let actionRow2 = hRow(distribution: .fillEqually)
-        restoreFloatsButton = NSButton(title: "恢复所有浮动窗口", target: self, action: #selector(panelRestoreFloats(_:)))
+        focusButton = NSButton(title: "Focus", target: self, action: #selector(panelToggleFocus(_:)))
+        restoreFloatsButton = NSButton(title: "恢复浮动窗口", target: self, action: #selector(panelRestoreFloats(_:)))
         resetSizesButton = NSButton(title: "重置尺寸", target: self, action: #selector(panelResetSizes(_:)))
+        actionRow2.addArrangedSubview(focusButton!)
         actionRow2.addArrangedSubview(restoreFloatsButton!)
         actionRow2.addArrangedSubview(resetSizesButton!)
         stack.addArrangedSubview(w288(actionRow2))
@@ -779,7 +820,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // v8：No peek 开关（Dim 固定 0.5、Blur 固定关，不再提供选项）
         let npRow = hRow()
-        let npLabel = NSTextField(labelWithString: "No peek 模式 ⌃⌥D")
+        let npLabel = NSTextField(labelWithString: "No peek mode ⌃⌥D")
         npLabel.font = .systemFont(ofSize: 12)
         npLabel.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         noPeekSwitch = NSSwitch()
@@ -808,12 +849,28 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         csRow.addArrangedSubview(csSpacer)
         csRow.addArrangedSubview(cleanSpaceSwitch)
         stack.addArrangedSubview(w288(csRow))
+
+        let tileAppRow = hRow()
+        tileAppLabel = NSTextField(labelWithString: "Tile")
+        tileAppLabel.font = .systemFont(ofSize: 12)
+        tileAppLabel.lineBreakMode = .byTruncatingTail
+        tileAppSwitch = NSSwitch()
+        tileAppSwitch.target = self
+        tileAppSwitch.action = #selector(panelToggleTileApp(_:))
+        tileAppSwitch.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        let tileAppSpacer = NSView()
+        tileAppSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        tileAppRow.addArrangedSubview(tileAppLabel)
+        tileAppRow.addArrangedSubview(tileAppSpacer)
+        tileAppRow.addArrangedSubview(tileAppSwitch)
+        stack.addArrangedSubview(w288(tileAppRow))
         stack.addArrangedSubview(w288(separator()))
 
-        // 设置行（B 批）
         let settingsRow = hRow(distribution: .fillEqually)
-        let settingsBtn = NSButton(title: "设置", target: self, action: #selector(panelOpenSettings(_:)))
+        let settingsBtn = NSButton(title: "Settings", target: self, action: #selector(panelOpenSettings(_:)))
+        let shortcutsBtn = NSButton(title: "Keyboard shortcuts", target: self, action: #selector(panelOpenShortcuts(_:)))
         settingsRow.addArrangedSubview(settingsBtn)
+        settingsRow.addArrangedSubview(shortcutsBtn)
         stack.addArrangedSubview(w288(settingsRow))
 
         // 底部（重新请求权限仅在未授权时显示）
@@ -869,15 +926,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let st = settingsFor(screen)
             let windows = collectWindows(on: screen)
             let (stacks, active) = computeTiles(windows: windows, st: st, sid: sid)
+            let windowCount = stacks.reduce(0) { $0 + $1.count }
             if stageManagerPaused {
                 statusDot.color = .systemOrange
-                statusLabel.stringValue = "Stage Manager 开启，已暂停 · \(layoutNameCN(st.layout))"
+                statusLabel.stringValue = "Stage Manager paused"
             } else if autoTile {
                 statusDot.color = .systemGreen
-                statusLabel.stringValue = "正在平铺 \(stacks.count) 个窗口 · \(layoutNameCN(st.layout))"
+                statusLabel.stringValue = "Tiling \(windowCount) window\(windowCount == 1 ? "" : "s")"
             } else {
                 statusDot.color = .systemGray
-                statusLabel.stringValue = "自动平铺已关闭 · \(layoutNameCN(st.layout))"
+                statusLabel.stringValue = "Tiling off"
             }
             tilesPlaceholder.isHidden = !stacks.isEmpty
             tilesStack.isHidden = stacks.isEmpty
@@ -912,21 +970,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             b.isSelected = (Layout.allCases[i] == panelSt.layout)
             b.needsDisplay = true
         }
-        let cap = capacity(panelSt.layout)
-        var anyDisabled = false
+        let cap = capacity(panelSt.layout, sid: screenID(panelScreen()))
+        arrangementLabel?.stringValue = arrangementCaption(panelSt.layout, count: min(panelSt.tileLimit, cap))
         for b in countButtons {
+            b.rects = countDiagram(panelSt.layout, count: b.indexTag)
             b.isSelected = (b.indexTag == panelSt.tileLimit)
             b.isDisabled = (b.indexTag > cap)
-            if b.indexTag > cap { anyDisabled = true }
             b.needsDisplay = true
         }
-        if anyDisabled {
-            switch panelSt.layout {
-            case .columns: countHintLabel.stringValue = "Columns 一屏最多 3 列，选 Grid 可排 4 个。"
-            case .rows: countHintLabel.stringValue = "Rows 一屏最多 2 行，选 Grid 可排 4 个。"
-            case .side: countHintLabel.stringValue = "Side 一屏最多 3 个，选 Grid 可排 4 个。"
-            case .grid: countHintLabel.stringValue = ""
-            }
+        if let hint = fitHintLine(panelSt.layout, fit: cap) {
+            countHintLabel.stringValue = hint
             countHintLabel.isHidden = false
         } else {
             countHintLabel.isHidden = true
@@ -946,7 +999,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 seg.selectedSegment = screens.firstIndex(where: { screenID($0) == screenID(panelScreen()) }) ?? 0
             }
         }
-        focusButton.title = focusMode ? "Focus 模式（开）" : "Focus 模式"
+        focusButton.title = focusMode ? "Focus on" : "Focus"
+        bordersButton?.state = highlightMode == .none ? .off : .on
+        hoverFocusButton?.state = hoverActivate ? .on : .off
+        if let app = frontRegularApp(), let bid = app.bundleIdentifier {
+            let name = app.localizedName ?? bid
+            tileAppLabel?.stringValue = "Tile \(name)"
+            tileAppSwitch?.isEnabled = true
+            tileAppSwitch?.state = excludedBundles.contains(bid) ? .off : .on
+        } else {
+            tileAppLabel?.stringValue = "Tile front app"
+            tileAppSwitch?.isEnabled = false
+            tileAppSwitch?.state = .off
+        }
         restoreFloatsButton.isEnabled = !floatedKeys.isEmpty || !middleFloatedKeys.isEmpty
         resetSizesButton.isHidden = splitOverrides.isEmpty
         shortcutsStatusLabel.isHidden = !tapUnavailable
@@ -980,11 +1045,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // C 批：布局/上限/尺寸/间距/满屏模式改的都是面板选中屏的设置
     // （主屏时同时同步全局镜像，保持单屏路径与旧行为一致）
     func applyLayout(_ l: Layout) {
-        var st = settingsFor(panelScreen())
+        let screen = panelScreen()
+        var st = settingsFor(screen)
         st.layout = l
-        setSettingsFor(st, screen: panelScreen())
-        log("layout -> \(l.rawValue) screen=\(screenName(panelScreen()))")
-        showToast("\(layoutNameCN(l))布局 · 本屏可放 \(capacity(l)) 个磁贴")
+        let cap = capacity(l, sid: screenID(screen))
+        if st.tileLimit > cap { st.tileLimit = cap }
+        setSettingsFor(st, screen: screen)
+        log("layout -> \(l.rawValue) screen=\(screenName(screen)) fit=\(cap)")
+        let toast = layoutToast(l, fit: cap)
+        showToast(toast.0, detail: toast.1, on: screen)
         forceTile()
         refreshPanel()
     }
@@ -992,11 +1061,147 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applyLimit(_ v: Int, screen: NSScreen? = nil) {
         let target = screen ?? panelScreen()
         var st = settingsFor(target)
+        let cap = capacity(st.layout, sid: screenID(target))
+        if v > cap {
+            if let hint = fitHintLine(st.layout, fit: cap) {
+                showToast(hint, on: target)
+            }
+            log("tileLimit \(v) rejected; \(st.layout.rawValue) fits \(cap) on \(screenName(target))")
+            refreshPanel()
+            return
+        }
         st.tileLimit = v
         setSettingsFor(st, screen: target)
         log("tileLimit -> \(v) screen=\(screenName(target))")
+        showToast("Up to \(v) window\(v == 1 ? "" : "s")", detail: "On this screen, in this Space.", on: target)
         forceTile()
         refreshPanel()
+    }
+
+    func countWord(_ n: Int) -> String {
+        switch n {
+        case 1: return "One"
+        case 2: return "Two"
+        case 3: return "Three"
+        case 4: return "Four"
+        default: return "\(n)"
+        }
+    }
+
+    func arrangementCaption(_ l: Layout, count: Int) -> String {
+        let w = countWord(max(1, min(4, count)))
+        switch l {
+        case .columns: return "Columns · \(w) column\(count == 1 ? "" : "s")"
+        case .rows: return "Rows · \(w) row\(count == 1 ? "" : "s")"
+        case .side: return "Side · \(w)"
+        case .grid: return "Grid · \(w)"
+        }
+    }
+
+    /// 数量按钮的小图，跟着当前布局变（Columns 是竖条，Rows 是横带，Grid/Side 是对应分法）。
+    /// 坐标 y 从上往下，与 DiagramButton 的约定一致。
+    func countDiagram(_ l: Layout, count: Int) -> [CGRect] {
+        let n = max(1, min(4, count))
+        let g: CGFloat = 0.08
+        func strips(_ vertical: Bool) -> [CGRect] {
+            let span = (1 - g * CGFloat(n - 1)) / CGFloat(n)
+            return (0..<n).map { i in
+                let o = CGFloat(i) * (span + g)
+                return vertical
+                    ? CGRect(x: o, y: 0, width: span, height: 1)
+                    : CGRect(x: 0, y: o, width: 1, height: span)
+            }
+        }
+        switch l {
+        case .columns: return strips(true)
+        case .rows: return strips(false)
+        case .grid:
+            switch n {
+            case 1: return [CGRect(x: 0, y: 0, width: 1, height: 1)]
+            case 2:
+                return [CGRect(x: 0, y: 0, width: 0.47, height: 1), CGRect(x: 0.53, y: 0, width: 0.47, height: 1)]
+            case 3:
+                return [
+                    CGRect(x: 0, y: 0, width: 0.56, height: 1),
+                    CGRect(x: 0.62, y: 0, width: 0.38, height: 0.47),
+                    CGRect(x: 0.62, y: 0.53, width: 0.38, height: 0.47),
+                ]
+            default:
+                return [
+                    CGRect(x: 0, y: 0, width: 0.47, height: 0.47),
+                    CGRect(x: 0.53, y: 0, width: 0.47, height: 0.47),
+                    CGRect(x: 0, y: 0.53, width: 0.47, height: 0.47),
+                    CGRect(x: 0.53, y: 0.53, width: 0.47, height: 0.47),
+                ]
+            }
+        case .side:
+            switch n {
+            case 1: return [CGRect(x: 0, y: 0, width: 1, height: 1)]
+            case 2:
+                return [CGRect(x: 0, y: 0, width: 0.58, height: 1), CGRect(x: 0.66, y: 0, width: 0.34, height: 1)]
+            default:
+                var rects = [CGRect(x: 0, y: 0, width: 0.58, height: 1)]
+                let gap: CGFloat = 0.04
+                let h = (1 - gap * CGFloat(n - 2)) / CGFloat(n - 1)
+                for i in 0..<(n - 1) {
+                    rects.append(CGRect(x: 0.66, y: CGFloat(i) * (h + gap), width: 0.34, height: h))
+                }
+                return rects
+            }
+        }
+    }
+
+    func fitHintLine(_ l: Layout, fit: Int) -> String? {
+        guard l != .grid, fit < 4 else { return nil }
+        switch l {
+        case .columns: return "This screen fits \(fit) columns. Pick Grid for four."
+        case .rows: return "This screen fits \(fit) rows. Pick Grid for four."
+        case .side: return "This screen fits \(fit). Pick Grid for four."
+        case .grid: return nil
+        }
+    }
+
+    func layoutToast(_ l: Layout, fit: Int) -> (String, String) {
+        switch l {
+        case .grid: return ("Grid", "One main window, the rest share the side. This screen fits \(fit).")
+        case .columns: return ("Columns", "Side by side. This screen fits \(fit).")
+        case .rows: return ("Rows", "Full width, one above the other. This screen fits \(fit).")
+        case .side: return ("Side", "One big window, the others in a column. This screen fits \(fit).")
+        }
+    }
+
+    func frontRegularApp() -> NSRunningApplication? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.activationPolicy == .regular,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return nil }
+        return app
+    }
+
+    @objc func panelToggleBorders(_ sender: NSButton) {
+        highlightMode = (highlightMode == .none) ? .borderActive : .none
+        log("borders -> \(highlightMode.rawValue)")
+        refreshHighlights()
+        refreshPanel()
+    }
+
+    @objc func panelToggleHoverFocus(_ sender: NSButton) {
+        hoverActivate = (sender.state == .on)
+        hoverActivateKey = nil
+        log("hover focus -> \(hoverActivate)")
+        refreshPanel()
+    }
+
+    @objc func panelToggleTileApp(_ sender: NSSwitch) {
+        guard let app = frontRegularApp(), let bid = app.bundleIdentifier else { return }
+        setAppExcluded(bid, sender.state != .on)
+        log("tile app \(app.localizedName ?? bid) -> \(sender.state == .on)")
+        forceTile()
+        refreshPanel()
+    }
+
+    @objc func panelOpenShortcuts(_ sender: NSButton) {
+        panelPopover.close()
+        openSettings(select: "Keyboard")
     }
 
     @objc func panelRatioChanged(_ sender: NSSegmentedControl) {
@@ -1022,7 +1227,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func panelTileNow(_ sender: NSButton) {
         forceTile()
-        showToast("已重新平铺")
+        showToast("Retiled", on: panelScreen())
         refreshPanel()
     }
 
@@ -1179,8 +1384,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return st
     }
 
-    func openSettings() {
+    func openSettings(select tab: String? = nil) {
         if let w = settingsWindow {
+            if let tab, let tv = settingsTabView,
+               let item = tv.tabViewItems.first(where: { ($0.identifier as? String) == tab || $0.label == tab }) {
+                tv.selectTabViewItem(item)
+            }
             w.makeKeyAndOrderFront(nil)
             NSRunningApplication.current.activate()
             return
@@ -1234,10 +1443,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         layoutRows.append(contentsOf: [
             stRow(label: "布局", control: stSegment(labels: ["Grid", "Columns", "Rows", "Side"], selected: Layout.allCases.firstIndex(of: pst.layout) ?? 0, action: #selector(settingsLayoutChanged(_:)))),
-            stRow(label: "主窗口尺寸", control: stSegment(labels: ["Half", "60%", "三分之二"], selected: MainRatio.allCases.firstIndex(of: pst.mainRatio) ?? 0, action: #selector(panelRatioChanged(_:)))),
-            stRow(label: "磁贴上限", control: stSegment(labels: ["1", "2", "3", "4"], selected: pst.tileLimit - 1, action: #selector(settingsLimitChanged(_:)))),
+            stRow(label: "主窗口尺寸", control: stSegment(labels: ["Half", "60%", "Two-thirds"], selected: MainRatio.allCases.firstIndex(of: pst.mainRatio) ?? 0, action: #selector(panelRatioChanged(_:)))),
+            stNote("主窗口从这里起步，其余窗口分剩下的空间。Grid 两格是等分，四格是田字，不受这项影响。"),
+            stRow(label: "磁贴上限", control: stSegment(labels: ["1", "2", "3", "4"], selected: max(0, pst.tileLimit - 1), action: #selector(settingsLimitChanged(_:)))),
             stRow(label: "屏幕满时", control: stSegment(labels: ["堆叠进活动磁贴", "居中浮动"], selected: pst.overflowMode == .stack ? 0 : 1, action: #selector(settingsOverflowChanged(_:)))),
+            stNote("堆叠：新窗口盖到活动磁贴最上面。居中浮动：先浮在中间，直到有空位再归位。"),
+            stNote("Columns 在 MacBook 上放得下三列，更宽的屏幕四列；Rows 两行或三行；Side 三个或四个。竖屏一律按行往下堆。"),
             stRow(label: "间距", control: stSegment(labels: ["4 pt", "8 pt", "16 pt"], selected: [4, 8, 16].firstIndex(of: Int(pst.gap)) ?? 1, action: #selector(panelGapChanged(_:)))),
+            stNote("窗口之间和屏幕边缘用同一间距。单窗全屏磁贴不留边。"),
         ])
         let layoutTab = stStack(layoutRows)
         tabs.addTabViewItem(item("Layout", stTab(layoutTab)))
@@ -1250,6 +1463,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tabs.frame = win.contentView!.bounds
         tabs.autoresizingMask = [.width, .height]
         win.contentView!.addSubview(tabs)
+        settingsTabView = tabs
+        if let tab, let item = tabs.tabViewItems.first(where: { ($0.identifier as? String) == tab || $0.label == tab }) {
+            tabs.selectTabViewItem(item)
+        }
         win.center()
         settingsWindow = win
         win.makeKeyAndOrderFront(nil)
@@ -1265,7 +1482,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let tourCards: [(String, String)] = [
         ("TileProto 是什么", "自动把窗口排成磁贴，不用手动拖大小、不用记位置。开几个窗口，就排几个磁贴。"),
         ("自动平铺", "菜单栏 ▦ → 打开“自动平铺”，新窗口打开就自动入队；关掉后窗口保持原位，新开窗口居中出现。"),
-        ("悬停条与分隔线", "鼠标移到活动窗口顶部的蓝色小圆点，弹出 Primary / Focus / Float 快捷条；磁贴之间的蓝色小圆点手柄，拖动改两侧比例；堆叠磁贴顶部有橙色标记，点开可切换。"),
+        ("悬停条与分隔线", "指针在窗口上沿停留，弹出深色快捷条：堆叠时有 ‹ › 和窗口芯片，以及 Primary / Focus / Float。拖两窗之间的缝，整列或整行一起变宽。堆叠磁贴上方有橙色握把，点一下或按 ⌃⌥` 切换。"),
         ("快捷键", "⌃⌥方向交换窗口，⌃⌥Z Focus，⌃⌥F Float，⌥⇥ 打开 Tab View；⌃⌥⌘1–4 改磁贴数量。"),
         ("设置", "菜单栏面板底部点“设置”：布局、主尺寸、鼠标、键盘、排除应用都在里面。"),
     ]
@@ -1348,10 +1565,13 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func buildMouseTab() -> NSStackView {
         return stStack([
             stRow(label: "悬停快捷条", control: stSwitch(state: hoverBarOn, action: #selector(settingsToggleHoverBar(_:)))),
-            stNote("悬停条：鼠标停在活动窗口顶部的蓝色小圆点时弹出 Primary / Focus / Float。"),
-            stNote("分隔线手柄：拖动两窗之间的蓝色小圆点改两侧比例。"),
-            stNote("⌘拖动：按住 ⌘ 拖窗口到另一磁贴，松手交换两窗。"),
-            stNote("⌥⌘拖动：按住 ⌥⌘ 拖窗口到某磁贴，松手加入该磁贴堆叠。"),
+            stNote("Quick actions above windows：指针在窗口上沿停留后出现深色条。堆叠里有 ‹ › 和每个窗口的芯片，再加上 Primary ⌃⌥↩、Focus ⌃⌥Z、Float ⌃⌥F。"),
+            stRow(label: "Hover focus", control: stSwitch(state: hoverActivate, action: #selector(settingsToggleHoverActivate(_:)))),
+            stNote("Activate windows on hover：指针停在窗口上就激活，不用再点。默认关。"),
+            stNote("缝：拖两块磁贴之间的间隙，整列或整行一起缩放，间隙宽度保持不变。"),
+            stNote("交换：按住 ⌘ 把一个窗口拖到另一个上面，松手对调。"),
+            stNote("加入堆叠：按住 ⌃⌘ 把窗口拖到某块磁贴上，松手堆进去。"),
+            stNote("普通拖动不会重排。松手后窗口弹簧回到原磁贴，并提示按住 ⌘ 才能交换。"),
         ])
     }
 
@@ -1359,6 +1579,13 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hoverBarOn = (sender.state == .on)
         if !hoverBarOn { hideHoverBar() }
         log("hoverBar -> \(hoverBarOn)")
+    }
+
+    @objc func settingsToggleHoverActivate(_ sender: NSSwitch) {
+        hoverActivate = (sender.state == .on)
+        hoverActivateKey = nil
+        hoverFocusButton?.state = hoverActivate ? .on : .off
+        log("hover focus -> \(hoverActivate)")
     }
 
     func buildKeyboardTab() -> NSStackView {
@@ -1621,7 +1848,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("drag stack pin released")
             if !focusMode, !cleanSpaceOn { forceTile() }
         }
-        // Focus / Clean Space 期间自动平铺暂停（图标与授权状态仍正常刷新）
+        // Focus / Clean Space 期间自动平铺暂停。还原弹簧的前 0.6s 也先别重排，
+        // 否则离屏窗口还没回到磁贴，签名会把布局打乱。
+        if CACurrentMediaTime() < tileHoldUntil { return }
         guard !focusMode, !cleanSpaceOn else {
             hideGrips()
             hideHoverBar()
@@ -1652,23 +1881,26 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             refreshDimLayers()
             refreshHighlights()
         }
-        // 普通拖动弹回：无 ⌘ 拖动已平铺窗口后松手，若仍在同一屏且位置移动超 4pt，瞬时弹回原磁贴；
-        // 已跨屏的不弹回，交给集合变化的立即重排在新屏平铺
+        // 普通拖动弹回：没按 ⌘ 拖已平铺窗口，松手后若仍在同一屏且位置或尺寸偏离落点，
+        // 用同一条 0.5s 弹簧回到上次落点，并提示要按 ⌘ 才能交换。正在飞的窗口不参与。
+        // 已经跨到另一块屏的不弹回，交给集合变化后在新屏重排。
         if NSEvent.pressedMouseButtons == 0, draggingDividerID == nil, dragState == nil, pendingDrag == nil {
             var toasted = false
-            let mh = mainHeight()
             for (sid, tiles) in lastTilesByScreen {
                 let live = tickWindows.filter { screenID(screenForFrame($0.frame)) == sid }
                 for t in tiles {
                     let key = winKey(t.top)
+                    guard frameMotions[key] == nil else { continue }
                     guard let placed = lastPlacedFrames[key],
                           let w = live.first(where: { winKey($0) == key }) else { continue }
                     let dx = w.frame.minX - placed.minX, dy = w.frame.minY - placed.minY
-                    guard dx * dx + dy * dy > 16 else { continue }
+                    let dw = w.frame.width - placed.width, dh = w.frame.height - placed.height
+                    guard dx * dx + dy * dy + dw * dw + dh * dh > 16 else { continue }
                     guard screenID(screenForFrame(w.frame)) == sid else { continue }
-                    setPosition(w.element, CGPoint(x: placed.minX, y: mh - placed.maxY))
+                    placeFrame(w.element, placed, key: key, animated: true)
                     if !toasted {
-                        showToast("普通拖动不会重排，按住 ⌘ 可交换")
+                        let screen = NSScreen.screens.first(where: { screenID($0) == sid })
+                        showToast("A plain drag never rearranges.", detail: "Hold ⌘ to swap.", on: screen)
                         toasted = true
                     }
                 }
@@ -1808,9 +2040,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                    ["AXDialog", "AXSystemDialog", "AXFloatingWindow", "AXSystemFloatingWindow"].contains(sub) { continue }
                 let title = stringAttr(w, kAXTitleAttribute as CFString) ?? ""
                 let frame = getFrame(w, screenHeight: mh) ?? .zero
+                // 弹簧进行中 AX 与 CG 会差一帧以上，严格 2pt 比对会把正在飞的窗口从集合里丢掉，
+                // 签名一变就会把动画打断。正在动画的窗口直接留下。
+                let moving = frameMotions[winKey(pid: app.processIdentifier, title: title)] != nil
                 // C 批 Space 过滤：只保留能在当前 Space 在屏列表里按 pid+bounds 对上的窗口；
                 // AX frame（Cocoa 系）转回 y 向下系再比对：axY = 主屏高 - cocoaMaxY
-                if onlyCurrentSpace, !onScreen.isEmpty {
+                if onlyCurrentSpace, !onScreen.isEmpty, !moving {
                     let axY = mh - frame.maxY
                     let ok = onScreen.contains {
                         $0.pid == app.processIdentifier
@@ -1912,13 +2147,39 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 布局几何
 
-    func capacity(_ l: Layout) -> Int {
-        switch l {
-        case .grid: return 4
-        case .columns: return 3
-        case .rows: return 2
-        case .side: return 3
+    /// 这块屏在该布局下能放下几块磁贴。
+    /// 阈值按可见区域的点算（菜单栏和 Dock 已经不在 visibleFrame 里），
+    /// 对齐 Shoji 文案：MacBook 级屏幕 Columns 3、Rows 2、Side 3、Grid 4；
+    /// 更宽（≥1800pt，16 寸默认约 1728 仍算 MacBook）Columns 到 4；
+    /// 更高（≥1100pt）Rows 到 3；宽和高都过线 Side 才到 4。
+    /// 竖屏（高大于宽）一律按行堆：Columns 降到 2，Rows 升到 3。
+    func fitCount(_ layout: Layout, visible vf: CGRect) -> Int {
+        let w = vf.width
+        let h = vf.height
+        let tall = h > w
+        switch layout {
+        case .grid:
+            return 4
+        case .columns:
+            if tall { return 2 }
+            return w >= 1800 ? 4 : 3
+        case .rows:
+            if tall { return h >= 900 ? 3 : 2 }
+            return h >= 1100 ? 3 : 2
+        case .side:
+            if !tall, w >= 1800, h >= 1100 { return 4 }
+            return 3
         }
+    }
+
+    func capacity(_ l: Layout, sid: CGDirectDisplayID) -> Int {
+        let vf: CGRect
+        if let s = NSScreen.screens.first(where: { screenID($0) == sid }) {
+            vf = s.visibleFrame
+        } else {
+            vf = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1440, height: 900)
+        }
+        return fitCount(l, visible: vf)
     }
 
     // 主窗口在左 + 右列 sideRows 个磁贴（Grid 3 磁贴与 Side 3 磁贴共用）
@@ -1983,7 +2244,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     CGRect(x: vf.minX + g + mw + g, y: vf.minY + g, width: sw, height: vf.height - 2 * g),
                 ]
             default:
-                return mainAndSideFrames(vf: vf, sideRows: 2, st: st)
+                // Side 3 = 主窗 + 右侧 2 格；Side 4 = 主窗 + 右侧 3 格。
+                return mainAndSideFrames(vf: vf, sideRows: max(1, t - 1), st: st)
             }
         }
     }
@@ -2011,21 +2273,115 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return ordered
     }
 
+    /// 丢掉已经关闭的成员，把 A→B→C 收成 A→C，环（A→B→A）拆掉。
+    /// 收完之后 host 自己一定不再是别人的成员。
+    func normalizeStackedOnto(liveKeys: Set<String>) {
+        stackedOnto = stackedOnto.filter { liveKeys.contains($0.key) && liveKeys.contains($0.value) && $0.key != $0.value }
+        var guardN = 0
+        var changed = true
+        while changed && guardN < 8 {
+            changed = false
+            guardN += 1
+            let snapshot = Array(stackedOnto)
+            for (m, h) in snapshot {
+                guard let hh = stackedOnto[h] else { continue }
+                if hh == m || hh == h {
+                    stackedOnto.removeValue(forKey: m)
+                } else {
+                    stackedOnto[m] = hh
+                }
+                changed = true
+            }
+        }
+        stackedOnto = stackedOnto.filter { $0.key != $0.value && stackedOnto[$0.value] == nil }
+    }
+
+    /// ⌘ 交换两扇窗时对调它们的堆叠身份。其余窗口留在原来的磁贴：
+    /// 原来跟着 A 的，改跟刚来到这块磁贴的 B。
+    func exchangeStackRoles(_ a: String, _ b: String) {
+        guard a != b else { return }
+        let hostA = stackedOnto[a]
+        let hostB = stackedOnto[b]
+        if let hostB, hostB != a {
+            stackedOnto[a] = hostB
+        } else {
+            stackedOnto.removeValue(forKey: a)
+        }
+        if let hostA, hostA != b {
+            stackedOnto[b] = hostA
+        } else {
+            stackedOnto.removeValue(forKey: b)
+        }
+        if stackedOnto[a] == a { stackedOnto.removeValue(forKey: a) }
+        if stackedOnto[b] == b { stackedOnto.removeValue(forKey: b) }
+        var retarget: [String: String] = [:]
+        for (m, h) in stackedOnto where m != a && m != b {
+            if h == a { retarget[m] = b }
+            else if h == b { retarget[m] = a }
+        }
+        for (m, h) in retarget where m != h {
+            stackedOnto[m] = h
+        }
+        stackedOnto = stackedOnto.filter { $0.key != $0.value }
+    }
+
     func computeTiles(windows: [WinInfo], st: ScreenSettings, sid: CGDirectDisplayID) -> (stacks: [[WinInfo]], active: Int) {
         let windows = orderedWindows(windows)
-        let t = Swift.min(Swift.min(st.tileLimit, capacity(st.layout)), windows.count)
+        normalizeStackedOnto(liveKeys: Set(windows.map { winKey($0) }))
+        let roots = windows.filter { stackedOnto[winKey($0)] == nil }
+        let rootPool = roots.isEmpty ? windows : roots
+        let t = Swift.min(Swift.min(st.tileLimit, capacity(st.layout, sid: sid)), rootPool.count)
         guard t > 0 else { return ([], 0) }
-        var stacks: [[WinInfo]] = (0..<t).map { [windows[$0]] }
+        var stacks: [[WinInfo]] = (0..<t).map { [rootPool[$0]] }
+        // 活动磁贴：先记住上一轮。焦点如果落在一块已经占着格子的根窗口上，改跟它。
+        // 刚打开、排在根窗口末尾的新窗口下标 ≥ t，不会把活动磁贴拽走。
+        // 已经手动堆进别人磁贴的窗口也不是根，不能把活动磁贴拽走。
         var active = 0
-        if let fi = frontmostIndex(windows: windows), fi < t { active = fi }
-        // D 批：⌥⌘拖进堆叠后 pin 住目标磁贴，直到用户切到别的 App 才放开；
-        // 否则被拖窗口一被 raise，前台 App 一变，超量窗口会滑到别的磁贴的堆叠里；
-        // C 批：pin 只对拖动发生的屏生效
+        if let remembered = lastActiveTileByScreen[sid], remembered < t { active = remembered }
+        if let fi = focusedIndex(windows: windows), windows.indices.contains(fi) {
+            let fk = winKey(windows[fi])
+            if stackedOnto[fk] == nil, let ti = stacks.firstIndex(where: { $0.contains { winKey($0) == fk } }) {
+                active = ti
+            }
+        }
+        // ⌃⌘ 拖进堆叠后 pin 住目标磁贴，直到用户切到别的 App 才放开。
         if let p = pinnedActiveTile, pinnedScreenID == sid { active = Swift.min(p, t - 1) }
-        if windows.count > t {
-            for w in windows[t...] { stacks[active].append(w) }
+        let stacking = st.overflowMode == .stack
+        if stacking, rootPool.count > t {
+            for w in rootPool[t...] { stacks[active].append(w) }
+        }
+        if !roots.isEmpty {
+            for w in windows {
+                guard let host = stackedOnto[winKey(w)] else { continue }
+                if let ti = stacks.firstIndex(where: { $0.contains { winKey($0) == host } }) {
+                    stacks[ti].append(w)
+                } else if stacking {
+                    stacks[active].append(w)
+                }
+            }
         }
         return (stacks, active)
+    }
+
+    /// 前台 App 的焦点窗口在这份列表里的下标。对不上时返回 nil，调用方再退回“该 App 的第一扇窗”。
+    func focusedIndex(windows: [WinInfo]) -> Int? {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &value) == .success,
+              let raw = value, CFGetTypeID(raw) == AXUIElementGetTypeID() else {
+            return frontmostIndex(windows: windows)
+        }
+        let focused = raw as! AXUIElement
+        let title = stringAttr(focused, kAXTitleAttribute as CFString) ?? ""
+        let frame = getFrame(focused, screenHeight: mainHeight()) ?? .zero
+        if let exact = windows.firstIndex(where: {
+            $0.pid == app.processIdentifier && $0.title == title && framesClose($0.frame, frame)
+        }) {
+            return exact
+        }
+        return windows.firstIndex(where: { $0.pid == app.processIdentifier && $0.title == title })
+            ?? frontmostIndex(windows: windows)
     }
 
     // MARK: - 平铺（C 批：按屏分治，每屏独立设置与磁贴）
@@ -2050,6 +2406,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 消失窗口：顺序与落点记录按全屏集合统一裁剪；Primary 全屏都不见才清
         windowOrder.removeAll { key in !allWindows.contains(where: { winKey($0) == key }) }
         lastPlacedFrames = lastPlacedFrames.filter { entry in allWindows.contains(where: { winKey($0) == entry.key }) }
+        normalizeStackedOnto(liveKeys: Set(allWindows.map { winKey($0) }))
         if let pk = primaryKey, !allWindows.contains(where: { winKey($0) == pk }) {
             primaryKey = nil
         }
@@ -2128,7 +2485,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let ordered = middleFloatOrder.filter { k in live.contains(where: { winKey($0) == k }) }
                 + live.map { winKey($0) }.filter { !middleFloatOrder.contains($0) }
             for key in ordered {
-                guard windows.count < min(st.tileLimit, capacity(st.layout)) else { break }
+                guard windows.count < min(st.tileLimit, capacity(st.layout, sid: sid)) else { break }
                 guard let w = live.first(where: { winKey($0) == key }) else { continue }
                 middleFloatedKeys.remove(key)
                 middleFloatOrder.removeAll { $0 == key }
@@ -2143,8 +2500,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let vf = screen.visibleFrame
         let sig = signature(windows)
-        // 窗口集合一变，该屏各磁贴的栈顶复位，避免指到不存在的位置
-        if sig != lastTiledSignatureByScreen[sid] {
+        let previousTiles = lastTilesByScreen[sid] ?? []
+        let previousKeys = Set(previousTiles.flatMap { $0.stack.map { winKey($0) } })
+        var preservedTopKeys: [String] = []
+        let signatureChanged = sig != lastTiledSignatureByScreen[sid]
+        if signatureChanged {
+            for (i, tile) in previousTiles.enumerated() where !tile.stack.isEmpty {
+                let idx = min(stackTops[stackTopKey(sid, i)] ?? 0, tile.stack.count - 1)
+                preservedTopKeys.append(winKey(tile.stack[idx]))
+            }
+            // 下标会随关窗错位，按窗口键在新堆叠里再找回来；不要把每一叠都清成 0。
             stackTops = stackTops.filter { !$0.key.hasPrefix("\(sid):") }
             lastTiledSignatureByScreen[sid] = sig
         }
@@ -2152,7 +2517,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 堆叠产生时提示一次（从无堆叠变为有堆叠才弹，不刷屏）
         let hasStack = stacks.contains { $0.count > 1 }
         if hasStack, lastStackByScreen[sid] != true {
-            showToast("已堆叠进当前磁贴，按 ⌃⌥` 或点磁贴上方标记切换")
+            showToast("Stacked in this tile", detail: "Press ⌃⌥` or click the grip above the window to switch.", on: screen)
         }
         lastStackByScreen[sid] = hasStack
         let origFrames = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: vf, st: st), tileCount: stacks.count, vf: vf, st: st, sid: sid)
@@ -2201,36 +2566,34 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("min-size floated: \(minFloatTops.map { $0.win.appName }.joined(separator: ","))")
         }
         let active = fitStacks.firstIndex(where: { $0.contains(where: { winKey($0) == activeTopKey }) }) ?? 0
-        let mh = mainHeight()
+        if signatureChanged {
+            for (i, stack) in fitStacks.enumerated() {
+                if let key = preservedTopKeys.first(where: { k in stack.contains { winKey($0) == k } }),
+                   let idx = stack.firstIndex(where: { winKey($0) == key }) {
+                    stackTops[stackTopKey(sid, i)] = idx
+                }
+            }
+            // 新开的焦点窗口盖到它所在磁贴的最上面，而不是垫在旧窗口底下。
+            if let fi = focusedIndex(windows: windows), windows.indices.contains(fi) {
+                let fk = winKey(windows[fi])
+                if !previousKeys.contains(fk) {
+                    for (i, stack) in fitStacks.enumerated() {
+                        if let idx = stack.firstIndex(where: { winKey($0) == fk }) {
+                            stackTops[stackTopKey(sid, i)] = idx
+                            AXUIElementPerformAction(windows[fi].element, kAXRaiseAction as CFString)
+                        }
+                    }
+                }
+            }
+        }
         var placed = 0
+        let animateMoves = draggingDividerID == nil
         for (i, stack) in fitStacks.enumerated() {
             for w in stack {
                 let target = frames[i]
                 let preSize = getSize(w.element)
-                setSize(w.element, target.size)
-                // AX 坐标原点在主屏左上角，y 向下；Cocoa 原点在左下角，y 向上；
-                // 换算恒以主屏高为基准，多屏下同样成立
-                setPosition(w.element, CGPoint(x: target.minX, y: mh - target.maxY))
-                // C2 最小尺寸学习：此前已够大、落点后仍缩不到目标（>4pt），
-                // 连续 2 次即学会该应用的最小尺寸（取实际落到的尺寸）；
-                // 成功落点或正在放大时清零，读不到尺寸时不计
-                let postSize = getSize(w.element)
-                if let bid = bundleID(for: w.pid) {
-                    if let pre = preSize, let post = postSize,
-                       pre.width >= target.width - 4, pre.height >= target.height - 4,
-                       (post.width < target.width - 4 || post.height < target.height - 4) {
-                        shrinkFailures[bid, default: 0] += 1
-                        if shrinkFailures[bid]! >= 2 {
-                            setLearnedMinSize(bid: bid, size: post)
-                            shrinkFailures[bid] = 0
-                            log("min-size learned: \(w.appName) \(Int(post.width))x\(Int(post.height))")
-                        }
-                    } else if postSize != nil {
-                        shrinkFailures[bid] = 0
-                    }
-                }
-                // Activity：只计实际落点变化的放置（0.5 秒补铺同帧不重复计）
                 let key = winKey(w)
+                placeFrame(w.element, target, key: key, animated: animateMoves, learnBid: bundleID(for: w.pid), learnName: w.appName, preSize: preSize)
                 if lastPlacedFrames[key] != frames[i] {
                     lastPlacedFrames[key] = frames[i]
                     placed += 1
@@ -2242,25 +2605,23 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for (w, mn) in minFloatTops {
             let fw = min(mn.width, vf.width), fh = min(mn.height, vf.height)
             let fx = vf.midX - fw / 2, fy = vf.midY - fh / 2
-            setSize(w.element, CGSize(width: fw, height: fh))
-            setPosition(w.element, CGPoint(x: fx, y: mh - (fy + fh)))
+            placeFrame(w.element, CGRect(x: fx, y: fy, width: fw, height: fh), key: winKey(w), animated: animateMoves)
         }
         // B 批：居中浮动模式——超量窗口不进堆叠，改为居中偏右的浮动小窗口，
         // 压在布局之上，平铺布局本身不重排；已浮动的窗口下次 tick 不再进集合
         var middleCount = 0
         if st.overflowMode == .floatMiddle {
             let ordered = orderedWindows(windows)
-            if ordered.count > fitStacks.count {
+            let placed = Set(fitStacks.flatMap { $0.map { winKey($0) } })
+            let extras = ordered.filter { !placed.contains(winKey($0)) && !minSizeFloatedKeys.contains(winKey($0)) }
+            if !extras.isEmpty {
                 let fw = vf.width * 0.45, fh = vf.height * 0.6
                 let fx = vf.midX - fw / 2
                 let fy = vf.midY - fh / 2
-                for w in ordered[fitStacks.count...] {
-                    // C2：已因最小尺寸居中浮动的窗口不再按超量处理，避免二次覆盖
-                    if minSizeFloatedKeys.contains(winKey(w)) { continue }
+                for w in extras {
                     middleFloatedKeys.insert(winKey(w))
                     if !middleFloatOrder.contains(winKey(w)) { middleFloatOrder.append(winKey(w)) }
-                    setSize(w.element, CGSize(width: fw, height: fh))
-                    setPosition(w.element, CGPoint(x: fx, y: mh - (fy + fh)))
+                    placeFrame(w.element, CGRect(x: fx, y: fy, width: fw, height: fh), key: winKey(w), animated: animateMoves)
                     middleCount += 1
                 }
             }
@@ -2269,7 +2630,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         lastScreenFrameByScreen[sid] = screen.frame
         lastActiveTileByScreen[sid] = active
         lastTilesByScreen[sid] = fitStacks.enumerated().map { (i, s) in
-            (stack: s, frame: frames[i], top: s[min(stackTops[stackTopKey(sid, i)] ?? 0, s.count - 1)])
+            let top = s[min(stackTops[stackTopKey(sid, i)] ?? 0, s.count - 1)]
+            let shown = inFlightFrame(key: winKey(top)) ?? frames[i]
+            return (stack: s, frame: shown, top: top)
         }
         if refreshOverlays {
             refreshGrips()
@@ -2288,6 +2651,210 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let minSuffix = minFloatTops.isEmpty ? "" : " minFloated=\(minFloatTops.count)"
             log("tiled screen=\(screenName(screen)) \(windows.count) windows layout=\(st.layout.rawValue) limit=\(st.tileLimit) tiles=\(fitStacks.count) active=\(active) main=\(st.mainRatio.rawValue) gap=\(Int(st.gap))\(midSuffix)\(minSuffix) \(tileDesc)")
         }
+    }
+
+    // MARK: - 短弹簧（约 0.5s，轻微过冲，可被下一次布局打断）
+
+    struct FrameMotion {
+        let element: AXUIElement
+        let key: String
+        var from: CGRect
+        var to: CGRect
+        var start: CFTimeInterval
+        let duration: CFTimeInterval
+        let preSize: CGSize?
+        let learnBid: String?
+        let learnName: String
+    }
+
+    final class OpacityFade {
+        weak var window: NSWindow?
+        let from: CGFloat
+        let to: CGFloat
+        let start: CFTimeInterval
+        let duration: CFTimeInterval
+        let done: (() -> Void)?
+        init(window: NSWindow, from: CGFloat, to: CGFloat, start: CFTimeInterval, duration: CFTimeInterval, done: (() -> Void)?) {
+            self.window = window
+            self.from = from
+            self.to = to
+            self.start = start
+            self.duration = duration
+            self.done = done
+        }
+    }
+
+    var frameMotions: [String: FrameMotion] = [:]
+    var motionTimer: Timer?
+    var opacityFades: [OpacityFade] = []
+    var toastPopStart: CFTimeInterval?
+
+    /// easeOutBack，t=1 时精确落到 1，中途大约 5% 过冲。c1 取 1.15。
+    func springUnit(_ t: CGFloat) -> CGFloat {
+        if t <= 0 { return 0 }
+        if t >= 1 { return 1 }
+        let c1: CGFloat = 1.15
+        let c3 = c1 + 1
+        return 1 + c3 * pow(t - 1, 3) + c1 * pow(t - 1, 2)
+    }
+
+    func lerpRect(_ a: CGRect, _ b: CGRect, _ p: CGFloat) -> CGRect {
+        CGRect(
+            x: a.minX + (b.minX - a.minX) * p,
+            y: a.minY + (b.minY - a.minY) * p,
+            width: max(1, a.width + (b.width - a.width) * p),
+            height: max(1, a.height + (b.height - a.height) * p)
+        )
+    }
+
+    func framesClose(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 0.75 && abs(a.minY - b.minY) < 0.75
+            && abs(a.width - b.width) < 0.75 && abs(a.height - b.height) < 0.75
+    }
+
+    func applyAXFrame(_ el: AXUIElement, _ frame: CGRect) {
+        setSize(el, frame.size)
+        setPosition(el, CGPoint(x: frame.minX, y: mainHeight() - frame.maxY))
+    }
+
+    func inFlightFrame(key: String) -> CGRect? {
+        guard let m = frameMotions[key] else { return nil }
+        let t = CGFloat((CACurrentMediaTime() - m.start) / m.duration)
+        if t >= 1 { return m.to }
+        return lerpRect(m.from, m.to, springUnit(max(0, t)))
+    }
+
+    func noteShrink(bid: String, name: String, pre: CGSize, target: CGSize, post: CGSize?) {
+        if let post,
+           pre.width >= target.width - 4, pre.height >= target.height - 4,
+           (post.width < target.width - 4 || post.height < target.height - 4) {
+            shrinkFailures[bid, default: 0] += 1
+            if shrinkFailures[bid]! >= 2 {
+                setLearnedMinSize(bid: bid, size: post)
+                shrinkFailures[bid] = 0
+                log("min-size learned: \(name) \(Int(post.width))x\(Int(post.height))")
+            }
+        } else if post != nil {
+            shrinkFailures[bid] = 0
+        }
+    }
+
+    /// 把一扇窗送到 target。animated 时从当前（或飞行中）帧起跳，同一目的地不重开弹簧。
+    /// 分隔线拖动传 animated: false，手跟着走。
+    func placeFrame(_ el: AXUIElement, _ target: CGRect, key: String, animated: Bool, learnBid: String? = nil, learnName: String = "", preSize: CGSize? = nil) {
+        if animated, let existing = frameMotions[key], framesClose(existing.to, target) {
+            return
+        }
+        let from = inFlightFrame(key: key) ?? getFrame(el, screenHeight: mainHeight()) ?? target
+        if !animated || framesClose(from, target) {
+            frameMotions.removeValue(forKey: key)
+            applyAXFrame(el, target)
+            if let bid = learnBid, let pre = preSize {
+                noteShrink(bid: bid, name: learnName, pre: pre, target: target, post: getSize(el))
+            }
+            stopMotionTimerIfIdle()
+            return
+        }
+        frameMotions[key] = FrameMotion(
+            element: el, key: key, from: from, to: target,
+            start: CACurrentMediaTime(), duration: 0.5,
+            preSize: preSize, learnBid: learnBid, learnName: learnName
+        )
+        startMotionTimer()
+    }
+
+    func startMotionTimer() {
+        if motionTimer != nil { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.stepMotion()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        motionTimer = timer
+    }
+
+    func stopMotionTimerIfIdle() {
+        let popping = toastPopStart != nil
+        if frameMotions.isEmpty, opacityFades.isEmpty, !popping {
+            motionTimer?.invalidate()
+            motionTimer = nil
+        }
+    }
+
+    func stepMotion() {
+        let now = CACurrentMediaTime()
+        var finished: [String] = []
+        for (key, m) in frameMotions {
+            let t = CGFloat((now - m.start) / m.duration)
+            if t >= 1 {
+                applyAXFrame(m.element, m.to)
+                if let bid = m.learnBid, let pre = m.preSize {
+                    noteShrink(bid: bid, name: m.learnName, pre: pre, target: m.to, post: getSize(m.element))
+                }
+                finished.append(key)
+            } else {
+                applyAXFrame(m.element, lerpRect(m.from, m.to, springUnit(t)))
+            }
+        }
+        for key in finished { frameMotions.removeValue(forKey: key) }
+        if !frameMotions.isEmpty { syncOverlayFramesToMotion() }
+        var stillFading: [OpacityFade] = []
+        var fadeDone: [() -> Void] = []
+        for fade in opacityFades {
+            guard let window = fade.window else { continue }
+            let t = min(1, CGFloat((now - fade.start) / max(fade.duration, 0.0001)))
+            window.alphaValue = fade.from + (fade.to - fade.from) * t
+            if t < 1 {
+                stillFading.append(fade)
+            } else {
+                window.alphaValue = fade.to
+                if let done = fade.done { fadeDone.append(done) }
+            }
+        }
+        opacityFades = stillFading
+        // 完成回调里如果再登记一段淡入淡出，要落在上面的赋值之后，不然会被盖掉。
+        for done in fadeDone { done() }
+        if let pop = toastPopStart, let panel = toastPanel {
+            let t = min(1, CGFloat((now - pop) / 0.2))
+            panel.alphaValue = t
+            if t >= 1 { toastPopStart = nil }
+        }
+        if frameMotions.isEmpty, opacityFades.isEmpty, toastPopStart == nil {
+            motionTimer?.invalidate()
+            motionTimer = nil
+            refreshGrips()
+            refreshDimLayers()
+            refreshHighlights()
+            refreshStackMarkers()
+        }
+    }
+
+    func syncOverlayFramesToMotion() {
+        var changed = false
+        for (sid, var tiles) in lastTilesByScreen {
+            for i in tiles.indices {
+                let key = winKey(tiles[i].top)
+                if let live = inFlightFrame(key: key), !framesClose(tiles[i].frame, live) {
+                    tiles[i].frame = live
+                    changed = true
+                }
+            }
+            lastTilesByScreen[sid] = tiles
+        }
+        if changed {
+            let act = activeScreen()
+            lastTiles = lastTilesByScreen[screenID(act)] ?? []
+            refreshGrips()
+            refreshDimLayers()
+            refreshHighlights()
+            refreshStackMarkers()
+        }
+    }
+
+    func fadeWindow(_ window: NSWindow, to: CGFloat, duration: CFTimeInterval = 0.35, done: (() -> Void)? = nil) {
+        let job = OpacityFade(window: window, from: window.alphaValue, to: to, start: CACurrentMediaTime(), duration: duration, done: done)
+        opacityFades.removeAll { $0.window === window }
+        opacityFades.append(job)
+        startMotionTimer()
     }
 
     func setPosition(_ el: AXUIElement, _ point: CGPoint) {
@@ -2371,6 +2938,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             app.activate()
         }
         log("stack tile=\(active) top=\(next + 1)/\(stack.count): \(w.appName)")
+        refreshStackMarkers()
     }
 
     // MARK: - v6 可拖分隔线
@@ -2493,13 +3061,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             layer?.backgroundColor = NSColor.clear.cgColor
         }
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        // 分隔线中央手柄：小蓝圆点（面板 rect 仍是 10×48 / 48×10 的宽松点击区）
-        override func draw(_ dirtyRect: NSRect) {
-            let d: CGFloat = 10
-            let rect = NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
-            NSColor.systemBlue.setFill()
-            NSBezierPath(ovalIn: rect).fill()
+        // 命中区就是整条缝，平时不画点；拖的是间隙本身。
+        override func resetCursorRects() {
+            addCursorRect(bounds, cursor: (divider?.vertical ?? true) ? .resizeLeftRight : .resizeUpDown)
         }
+        override func draw(_ dirtyRect: NSRect) {}
         override func mouseDown(with event: NSEvent) { onDrag?(self, 0, 0) }
         override func mouseDragged(with event: NSEvent) {
             let m = NSEvent.mouseLocation
@@ -2523,10 +3089,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for d in dividers {
                 let key = "\(sid)-\(d.id)"
                 seen.insert(key)
-                let mid = (d.lo + d.hi) / 2
+                let thickness = max(effectiveGapFor(st), 8)
+                let span = max(8, d.hi - d.lo)
                 let rect: NSRect = d.vertical
-                    ? NSRect(x: d.center - 5, y: mid - 24, width: 10, height: 48)
-                    : NSRect(x: mid - 24, y: d.center - 5, width: 48, height: 10)
+                    ? NSRect(x: d.center - thickness / 2, y: d.lo, width: thickness, height: span)
+                    : NSRect(x: d.lo, y: d.center - thickness / 2, width: span, height: thickness)
                 if let panel = gripPanels[key] {
                     panel.setFrame(rect, display: true)
                     (panel.contentView as? GripView)?.divider = d
@@ -2549,6 +3116,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             let tileCount = self.lastTilesByScreen[dd.screenID]?.count ?? 0
                             self.splitOverrides["\(dd.screenID)-\(self.settingsFor(scr).layout.rawValue)-\(tileCount)-\(dd.id)"] = f
                             self.tile(screen: scr, windows: self.collectWindows(on: scr))
+                            if dd.vertical {
+                                v.window?.setFrameOrigin(NSPoint(x: clamped - v.bounds.width / 2, y: v.window?.frame.minY ?? 0))
+                            } else {
+                                v.window?.setFrameOrigin(NSPoint(x: v.window?.frame.minX ?? 0, y: clamped - v.bounds.height / 2))
+                            }
                         default:
                             self.draggingDividerID = nil
                             self.dragQuiet = false
@@ -2583,33 +3155,60 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var toastPanel: NSPanel?
     var toastWork: DispatchWorkItem?
 
-    func showToast(_ text: String) {
+    func showToast(_ title: String, detail: String? = nil, sticky: Bool = false, on screen: NSScreen? = nil) {
         toastWork?.cancel()
-        let font = NSFont.systemFont(ofSize: 12)
-        let maxW = (NSScreen.main?.visibleFrame.width ?? 800) - 40
-        let w = min(max((text as NSString).size(withAttributes: [.font: font]).width + 32, 120), maxW)
-        let h: CGFloat = 28
-        let vf = NSScreen.main?.visibleFrame ?? .zero
-        let rect = NSRect(x: vf.midX - w / 2, y: vf.minY + 24, width: w, height: h)
+        let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        let detailFont = NSFont.systemFont(ofSize: 11)
+        let titleW = (title as NSString).size(withAttributes: [.font: titleFont]).width
+        let detailW = detail.map { ($0 as NSString).size(withAttributes: [.font: detailFont]).width } ?? 0
+        let screen = screen ?? activeScreen()
+        let maxW = screen.visibleFrame.width - 48
+        let w = min(max(max(titleW, detailW) + 36, 160), maxW)
+        let h: CGFloat = detail == nil ? 36 : 58
+        let vf = screen.visibleFrame
+        let rect = NSRect(x: vf.midX - w / 2, y: vf.midY - h / 2 - 36, width: w, height: h)
+        let ink = NSColor(srgbRed: 0x16 / 255, green: 0x16 / 255, blue: 0x1a / 255, alpha: 0.96)
         if let p = toastPanel {
-            p.setFrame(rect, display: true)
-            (p.contentView?.subviews.first as? NSTextField)?.stringValue = text
+            p.setFrame(rect, display: false)
+            if let box = p.contentView {
+                box.layer?.backgroundColor = ink.cgColor
+                let labels = box.subviews.compactMap { $0 as? NSTextField }
+                if let first = labels.first { first.stringValue = title; first.font = titleFont }
+                if detail != nil {
+                    if labels.count > 1 {
+                        labels[1].stringValue = detail ?? ""
+                        labels[1].isHidden = false
+                    }
+                } else if labels.count > 1 {
+                    labels[1].stringValue = ""
+                    labels[1].isHidden = true
+                }
+            }
         } else {
             let v = NSView()
             v.wantsLayer = true
-            v.layer?.backgroundColor = NSColor(calibratedWhite: 0.1, alpha: 0.92).cgColor
-            v.layer?.cornerRadius = 14
-            let l = NSTextField(labelWithString: text)
-            l.font = font
-            l.textColor = .white
-            l.alignment = .center
-            l.translatesAutoresizingMaskIntoConstraints = false
-            v.addSubview(l)
+            v.layer?.backgroundColor = ink.cgColor
+            v.layer?.cornerRadius = 16
+            let titleLabel = NSTextField(labelWithString: title)
+            titleLabel.font = titleFont
+            titleLabel.textColor = .white
+            titleLabel.alignment = .center
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
+            let detailLabel = NSTextField(wrappingLabelWithString: detail ?? "")
+            detailLabel.font = detailFont
+            detailLabel.textColor = NSColor.white.withAlphaComponent(0.82)
+            detailLabel.alignment = .center
+            detailLabel.translatesAutoresizingMaskIntoConstraints = false
+            detailLabel.isHidden = detail == nil
+            v.addSubview(titleLabel)
+            v.addSubview(detailLabel)
             NSLayoutConstraint.activate([
-                l.centerXAnchor.constraint(equalTo: v.centerXAnchor),
-                l.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-                l.leadingAnchor.constraint(greaterThanOrEqualTo: v.leadingAnchor, constant: 16),
-                l.trailingAnchor.constraint(lessThanOrEqualTo: v.trailingAnchor, constant: -16),
+                titleLabel.topAnchor.constraint(equalTo: v.topAnchor, constant: detail == nil ? 9 : 8),
+                titleLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
+                titleLabel.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -14),
+                detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+                detailLabel.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 14),
+                detailLabel.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -14),
             ])
             let p = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.level = .floating
@@ -2621,10 +3220,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             p.contentView = v
             toastPanel = p
         }
+        toastPanel?.alphaValue = 0
         toastPanel?.orderFront(nil)
-        let work = DispatchWorkItem { [weak self] in self?.toastPanel?.orderOut(nil) }
+        toastPopStart = CACurrentMediaTime()
+        startMotionTimer()
+        guard !sticky else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let panel = self.toastPanel else { return }
+            self.fadeWindow(panel, to: 0, duration: 0.15) {
+                panel.orderOut(nil)
+                panel.alphaValue = 1
+            }
+        }
         toastWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
     func hideToast() {
@@ -2636,40 +3245,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - demo 补齐：活动磁贴顶部蓝圆点手柄 + 堆叠标记 + 堆叠浮层
 
     func refreshDotHandles() {
-        guard AXIsProcessTrusted(), autoTile, !focusMode, !cleanSpaceOn else {
-            hideDotHandles()
-            return
-        }
-        var seen: Set<String> = []
-        for (sid, tiles) in lastTilesByScreen where !tiles.isEmpty {
-            let active = lastActiveTileByScreen[sid] ?? 0
-            guard active < tiles.count else { continue }
-            let key = "\(sid):\(active)"
-            seen.insert(key)
-            let f = tiles[active].frame
-            let rect = NSRect(x: f.midX - 7, y: f.maxY - 7, width: 14, height: 14)
-            if let panel = dotPanels[key] {
-                panel.setFrame(rect, display: true)
-            } else {
-                let v = NSView(frame: NSRect(origin: .zero, size: rect.size))
-                v.wantsLayer = true
-                v.layer?.backgroundColor = NSColor.systemBlue.cgColor
-                v.layer?.cornerRadius = 7
-                let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-                panel.level = .floating
-                panel.backgroundColor = .clear
-                panel.isOpaque = false
-                panel.hasShadow = false
-                panel.ignoresMouseEvents = true
-                panel.contentView = v
-                panel.orderFront(nil)
-                dotPanels[key] = panel
-            }
-        }
-        for (k, p) in dotPanels where !seen.contains(k) {
-            p.orderOut(nil)
-            dotPanels.removeValue(forKey: k)
-        }
+        // Shoji 没有常驻蓝点。快捷条由窗口上沿的停留区触发。
+        hideDotHandles()
     }
 
     func hideDotHandles() {
@@ -2678,19 +3255,32 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     final class StackMarkerView: NSView {
-        var isTop: [Bool] = []
+        var count = 0
+        var topIndex = 0
         var onClick: (() -> Void)?
         override func draw(_ dirtyRect: NSRect) {
-            let d: CGFloat = 6, gap: CGFloat = 4
-            let total = CGFloat(isTop.count) * d + CGFloat(max(0, isTop.count - 1)) * gap
+            guard count > 1 else { return }
+            let h: CGFloat = 5
+            let gap: CGFloat = 3
+            var widths: [CGFloat] = []
+            for i in 0..<count { widths.append(i == topIndex ? 16 : 8) }
+            let total = widths.reduce(0, +) + gap * CGFloat(max(0, count - 1))
             var x = (bounds.width - total) / 2
-            for top in isTop {
-                (top ? NSColor.systemOrange : NSColor.systemGray).setFill()
-                NSBezierPath(ovalIn: NSRect(x: x, y: (bounds.height - d) / 2, width: d, height: d)).fill()
-                x += d + gap
+            let y = (bounds.height - h) / 2
+            for i in 0..<count {
+                let w = widths[i]
+                let alpha: CGFloat = i == topIndex ? 1 : 0.55
+                NSColor.systemOrange.withAlphaComponent(alpha).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: y, width: w, height: h), xRadius: h / 2, yRadius: h / 2).fill()
+                x += w + gap
             }
         }
         override func mouseDown(with event: NSEvent) { onClick?() }
+    }
+
+    func stackGripWidth(count: Int) -> CGFloat {
+        guard count > 1 else { return 0 }
+        return 16 + CGFloat(count - 1) * 8 + CGFloat(count - 1) * 3 + 10
     }
 
     func refreshStackMarkers() {
@@ -2704,17 +3294,28 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let key = "\(sid):\(i)"
                 seen.insert(key)
                 let topIdx = min(stackTops[stackTopKey(sid, i)] ?? 0, t.stack.count - 1)
-                let flags = t.stack.enumerated().map { $0.offset == topIdx }
-                let w = CGFloat(t.stack.count * 10 + 4)
-                let rect = NSRect(x: t.frame.midX - w / 2, y: t.frame.maxY - 20, width: w, height: 12)
+                let w = stackGripWidth(count: t.stack.count)
+                var rect = NSRect(x: t.frame.midX - w / 2, y: t.frame.maxY + 4, width: w, height: 14)
+                if let screen = NSScreen.screens.first(where: { screenID($0) == sid }), rect.maxY > screen.frame.maxY - 2 {
+                    rect.origin.y = t.frame.maxY - 16
+                }
                 if let panel = stackMarkerPanels[key] {
                     panel.setFrame(rect, display: true)
-                    (panel.contentView as? StackMarkerView)?.isTop = flags
+                    if let view = panel.contentView as? StackMarkerView {
+                        view.count = t.stack.count
+                        view.topIndex = topIdx
+                    }
                     panel.contentView?.needsDisplay = true
                 } else {
                     let view = StackMarkerView(frame: NSRect(origin: .zero, size: rect.size))
-                    view.isTop = flags
-                    view.onClick = { [weak self] in self?.showStackPanel(sid: sid, tile: i) }
+                    view.count = t.stack.count
+                    view.topIndex = topIdx
+                    view.onClick = { [weak self] in
+                        guard let self else { return }
+                        self.cycleStackAt(sid: sid, tile: i, dir: 1)
+                        self.refreshStackMarkers()
+                        self.refreshPanel()
+                    }
                     let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
                     panel.level = .floating
                     panel.backgroundColor = .clear
@@ -2894,32 +3495,72 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - v6 悬停快捷条（轮询鼠标位置，无需 CGEventTap 与新权限）
 
+    var hoverSid: CGDirectDisplayID = 0
+    var hoverTile = 0
+    var hoverZoneID: String?
+    var hoverZoneSince: CFTimeInterval = 0
+
     func setupHoverBar() {
         let pill = NSView()
         pill.wantsLayer = true
-        pill.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        pill.layer?.borderColor = NSColor.systemGray.cgColor
-        pill.layer?.borderWidth = 1
-        pill.layer?.cornerRadius = 15
-        pill.layer?.shadowColor = NSColor.black.cgColor
-        pill.layer?.shadowOpacity = 0.2
-        pill.layer?.shadowRadius = 4
-        pill.layer?.shadowOffset = NSSize(width: 0, height: -1)
+        pill.layer?.backgroundColor = NSColor(srgbRed: 0x16 / 255, green: 0x16 / 255, blue: 0x1a / 255, alpha: 0.96).cgColor
+        pill.layer?.cornerRadius = 12
+        hoverBarView = pill
+        hoverPanel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 280, height: 34), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        hoverPanel.level = .floating
+        hoverPanel.backgroundColor = .clear
+        hoverPanel.isOpaque = false
+        hoverPanel.hasShadow = true
+        pill.frame = NSRect(origin: .zero, size: hoverPanel.frame.size)
+        pill.autoresizingMask = [.width, .height]
+        hoverPanel.contentView = pill
+    }
+
+    func hoverChip(_ title: String, tag: Int, action: Selector, emphasized: Bool) -> NSButton {
+        let font = NSFont.systemFont(ofSize: 11, weight: emphasized ? .semibold : .regular)
+        let b = NSButton(title: title, target: self, action: action)
+        b.tag = tag
+        b.font = font
+        b.isBordered = false
+        b.bezelStyle = .inline
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: NSColor.white,
+            .font: font,
+        ])
+        b.wantsLayer = true
+        if emphasized {
+            b.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
+            b.layer?.cornerRadius = 6
+        }
+        return b
+    }
+
+    func showHoverBar(for tile: (stack: [WinInfo], frame: CGRect, top: WinInfo), screen: NSScreen, sid: CGDirectDisplayID, tileIndex: Int) {
+        hoverSid = sid
+        hoverTile = tileIndex
+        let topIdx = min(stackTops[stackTopKey(sid, tileIndex)] ?? 0, tile.stack.count - 1)
         let row = NSStackView()
         row.orientation = .horizontal
         row.spacing = 4
         row.edgeInsets = NSEdgeInsets(top: 3, left: 8, bottom: 3, right: 8)
         row.translatesAutoresizingMaskIntoConstraints = false
-        let mkBtn = { (title: String, action: Selector) -> NSButton in
-            let b = NSButton(title: title, target: self, action: action)
-            b.font = .systemFont(ofSize: 11)
-            b.bezelStyle = .inline
-            return b
+        if tile.stack.count > 1 {
+            row.addArrangedSubview(hoverChip("‹", tag: 0, action: #selector(hoverStackStep(_:)), emphasized: false))
+            for (idx, w) in tile.stack.enumerated() {
+                row.addArrangedSubview(hoverChip(w.appName, tag: idx, action: #selector(hoverPickStack(_:)), emphasized: idx == topIdx))
+            }
+            row.addArrangedSubview(hoverChip("›", tag: 1, action: #selector(hoverStackStep(_:)), emphasized: false))
         }
-        row.addArrangedSubview(mkBtn("Primary ⌃⌥↩", #selector(hoverPrimary(_:))))
-        row.addArrangedSubview(mkBtn("Focus ⌃⌥Z", #selector(hoverFocus(_:))))
-        row.addArrangedSubview(mkBtn("Float ⌃⌥F", #selector(hoverFloat(_:))))
-        hoverPrimaryButton = row.arrangedSubviews.first as? NSButton
+        let primary = hoverChip("Primary ⌃⌥↩", tag: 0, action: #selector(hoverPrimary(_:)), emphasized: false)
+        let (stacks, _) = computeTiles(windows: collectWindows(on: screen), st: settingsFor(screen), sid: sid)
+        let isPrimary = stacks.first?.first.map { winKey($0) == winKey(tile.stack[topIdx]) } ?? false
+        primary.isEnabled = !isPrimary
+        hoverPrimaryButton = primary
+        row.addArrangedSubview(primary)
+        row.addArrangedSubview(hoverChip("Focus ⌃⌥Z", tag: 0, action: #selector(hoverFocus(_:)), emphasized: false))
+        row.addArrangedSubview(hoverChip("Float ⌃⌥F", tag: 0, action: #selector(hoverFloat(_:)), emphasized: false))
+        let pill = hoverBarView ?? NSView()
+        for v in pill.subviews { v.removeFromSuperview() }
         pill.addSubview(row)
         NSLayoutConstraint.activate([
             row.topAnchor.constraint(equalTo: pill.topAnchor),
@@ -2927,33 +3568,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             row.trailingAnchor.constraint(equalTo: pill.trailingAnchor),
             row.bottomAnchor.constraint(equalTo: pill.bottomAnchor),
         ])
-        hoverBarView = pill
-        hoverPanel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 264, height: 32), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        hoverPanel.level = .floating
-        hoverPanel.backgroundColor = .clear
-        hoverPanel.hasShadow = false
-        pill.frame = NSRect(origin: .zero, size: hoverPanel.frame.size)
-        pill.autoresizingMask = [.width, .height]
-        hoverPanel.contentView = pill
-    }
-
-    func showHoverBar(for tile: (stack: [WinInfo], frame: CGRect, top: WinInfo), screen: NSScreen) {
-        let barW: CGFloat = 264, barH: CGFloat = 32
+        pill.layoutSubtreeIfNeeded()
+        let fit = row.fittingSize
+        let barW = min(max(fit.width, 180), screen.visibleFrame.width - 16)
+        let barH = max(fit.height, 32)
         let vf = screen.visibleFrame
         var x = tile.frame.midX - barW / 2
         x = min(max(x, vf.minX + 4), vf.maxX - barW - 4)
-        var y = tile.frame.maxY + 6
-        if y + barH > screen.frame.maxY - 2 {
-            y = tile.frame.maxY - barH - 2  // 顶部无空位时贴在窗口内沿
-        }
+        var y = tile.frame.maxY + 8
+        if y + barH > screen.frame.maxY - 2 { y = tile.frame.maxY - barH - 4 }
         hoverPanel.setFrame(NSRect(x: x, y: y, width: barW, height: barH), display: true)
         hoverPanel.orderFront(nil)
-        hoverKey = winKey(tile.top)
+        hoverKey = winKey(tile.stack[topIdx])
         hoverTileFrame = tile.frame
-        // 已是主窗口时 Primary 按钮禁用（判断标准与 hoverPrimary 一致：该屏首格首窗口即目标）
-        let (stacks, _) = computeTiles(windows: collectWindows(on: screen), st: settingsFor(screen), sid: screenID(screen))
-        let isPrimary = stacks.first?.first.map { winKey($0) == winKey(tile.top) } ?? false
-        hoverPrimaryButton?.isEnabled = !isPrimary
     }
 
     func hideHoverBar() {
@@ -2961,30 +3588,102 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         hoverKey = nil
     }
 
+    func tileUnderPointer(_ m: CGPoint) -> (sid: CGDirectDisplayID, index: Int, tile: (stack: [WinInfo], frame: CGRect, top: WinInfo), screen: NSScreen)? {
+        // 上沿热区会伸进上面那块磁贴几磅。多块同时命中时，取离自己上沿最近的那块，
+        // 不要跟着字典顺序碰运气。Hover focus 的窗体命中只在没有上沿热区时才用。
+        var best: (sid: CGDirectDisplayID, index: Int, tile: (stack: [WinInfo], frame: CGRect, top: WinInfo), screen: NSScreen)?
+        var bestScore = CGFloat.greatestFiniteMagnitude
+        for (sid, tiles) in lastTilesByScreen {
+            guard let screen = NSScreen.screens.first(where: { screenID($0) == sid }) else { continue }
+            for (i, t) in tiles.enumerated() {
+                let zone = CGRect(x: t.frame.minX, y: t.frame.maxY - 20, width: t.frame.width, height: 36)
+                let inZone = zone.contains(m)
+                let inBody = hoverActivate && t.frame.contains(m)
+                guard inZone || inBody else { continue }
+                let score = inZone ? abs(m.y - t.frame.maxY) : 10_000 + abs(m.y - t.frame.midY)
+                if score < bestScore {
+                    bestScore = score
+                    best = (sid, i, t, screen)
+                }
+            }
+        }
+        return best
+    }
+
     func updateHover() {
         guard hoverPanel != nil else { return }
+        let m = NSEvent.mouseLocation
+        if hoverActivate, AXIsProcessTrusted(), autoTile, !focusMode, !cleanSpaceOn, draggingDividerID == nil,
+           dragState == nil, NSEvent.pressedMouseButtons == 0 {
+            if let hit = tileUnderPointer(m), hit.tile.frame.contains(m) {
+                let key = winKey(hit.tile.top)
+                if hoverActivateKey != key {
+                    hoverActivateKey = key
+                    hoverActivateSince = CACurrentMediaTime()
+                } else if CACurrentMediaTime() - hoverActivateSince > 0.4 {
+                    let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+                    if hit.tile.top.pid != front {
+                        AXUIElementPerformAction(hit.tile.top.element, kAXRaiseAction as CFString)
+                        NSRunningApplication(processIdentifier: hit.tile.top.pid)?.activate()
+                        hoverActivateSince = CACurrentMediaTime() + 10
+                    }
+                }
+            } else {
+                hoverActivateKey = nil
+            }
+        }
         guard hoverBarOn, AXIsProcessTrusted(), autoTile, !focusMode, !cleanSpaceOn, draggingDividerID == nil,
               panelPopover == nil || !panelPopover.isShown else {
             hideHoverBar()
+            hoverZoneID = nil
             return
         }
-        let m = NSEvent.mouseLocation
         if hoverKey != nil {
-            // 已显示：鼠标仍在蓝圆点附近（6pt 容差）或条本身附近时保持，否则隐藏
             let barFrame = hoverPanel.frame.insetBy(dx: -8, dy: -8)
-            let nearDot = dotPanels.values.contains { $0.frame.insetBy(dx: -6, dy: -6).contains(m) }
-            if nearDot || barFrame.contains(m) { return }
+            let stillOnTile = tileUnderPointer(m).map { "\($0.sid):\($0.index)" } == "\(hoverSid):\(hoverTile)"
+            if barFrame.contains(m) || stillOnTile { return }
             hideHoverBar()
+            hoverZoneID = nil
             return
         }
-        // 未显示：仅悬停活动磁贴顶部中央的蓝圆点时出条（非活动磁贴无圆点、不出条）
-        for (key, p) in dotPanels where p.frame.insetBy(dx: -6, dy: -6).contains(m) {
-            let parts = key.split(separator: ":")
-            guard parts.count == 2, let sid = UInt32(String(parts[0])), let ti = Int(parts[1]),
-                  let tiles = lastTilesByScreen[CGDirectDisplayID(sid)], ti < tiles.count,
-                  let screen = NSScreen.screens.first(where: { screenID($0) == CGDirectDisplayID(sid) }) else { continue }
-            showHoverBar(for: tiles[ti], screen: screen)
+        guard let hit = tileUnderPointer(m) else {
+            hoverZoneID = nil
             return
+        }
+        let zone = CGRect(x: hit.tile.frame.minX, y: hit.tile.frame.maxY - 20, width: hit.tile.frame.width, height: 36)
+        guard zone.contains(m) else { return }
+        let id = "\(hit.sid):\(hit.index)"
+        if hoverZoneID != id {
+            hoverZoneID = id
+            hoverZoneSince = CACurrentMediaTime()
+            return
+        }
+        guard CACurrentMediaTime() - hoverZoneSince >= 0.22 else { return }
+        showHoverBar(for: hit.tile, screen: hit.screen, sid: hit.sid, tileIndex: hit.index)
+    }
+
+    @objc func hoverStackStep(_ sender: NSButton) {
+        let dir = sender.tag == 0 ? -1 : 1
+        cycleStackAt(sid: hoverSid, tile: hoverTile, dir: dir)
+        refreshStackMarkers()
+        if let tiles = lastTilesByScreen[hoverSid], hoverTile < tiles.count,
+           let screen = NSScreen.screens.first(where: { screenID($0) == hoverSid }) {
+            showHoverBar(for: tiles[hoverTile], screen: screen, sid: hoverSid, tileIndex: hoverTile)
+        }
+    }
+
+    @objc func hoverPickStack(_ sender: NSButton) {
+        let idx = sender.tag
+        guard let tiles = lastTilesByScreen[hoverSid], hoverTile < tiles.count,
+              idx >= 0, idx < tiles[hoverTile].stack.count else { return }
+        let w = tiles[hoverTile].stack[idx]
+        stackTops[stackTopKey(hoverSid, hoverTile)] = idx
+        AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
+        NSRunningApplication(processIdentifier: w.pid)?.activate()
+        refreshStackMarkers()
+        if let screen = NSScreen.screens.first(where: { screenID($0) == hoverSid }),
+           let fresh = lastTilesByScreen[hoverSid], hoverTile < fresh.count {
+            showHoverBar(for: fresh[hoverTile], screen: screen, sid: hoverSid, tileIndex: hoverTile)
         }
     }
 
@@ -3009,6 +3708,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("hover primary: already primary (\(w.appName))")
             return
         }
+        stackedOnto.removeValue(forKey: key)
         primaryKey = key
         log("hover primary -> \(w.appName)")
         forceTile()
@@ -3067,45 +3767,40 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("focus skipped: no windows on this screen")
             return
         }
-        let sh = mainHeight()
-        focusSaved = windows.compactMap { w in
-            guard let f = getFrame(w.element, screenHeight: sh) else { return nil }
-            return (w.element, f)
+        focusSaved = windows.compactMap { w -> (AXUIElement, CGRect, String)? in
+            let key = winKey(w)
+            let f = lastPlacedFrames[key] ?? frameMotions[key]?.to ?? getFrame(w.element, screenHeight: mainHeight())
+            guard let f else { return nil }
+            return (w.element, f, key)
         }
         let frontIdx = windows.firstIndex(where: { winKey($0) == winKey(frontAll) }) ?? 0
         let front = windows[min(frontIdx, windows.count - 1)]
         let vf = screen.visibleFrame
-        for (i, w) in windows.enumerated() {
-            if i == frontIdx {
-                setSize(w.element, vf.size)
-                setPosition(w.element, CGPoint(x: vf.minX, y: sh - vf.maxY))
-            } else if let pt = getAXPosition(w.element) {
-                // 只改 x，尺寸与 y 保持不动，窗口整体移出屏外
-                setPosition(w.element, CGPoint(x: -10000, y: pt.y))
-            }
-        }
         focusMode = true
-        log("focus on: front=\(front.appName), \(windows.count - 1) windows parked")
+        AXUIElementPerformAction(front.element, kAXRaiseAction as CFString)
+        // 其余窗口留在原磁贴上，被放大的活动窗口盖住；还原时它们的 frame 没被动过。
+        placeFrame(front.element, vf, key: winKey(front), animated: true)
+        log("focus on: front=\(front.appName)")
         hideGrips()
         hideHoverBar()
         hideDotHandles()
         hideStackMarkers()
         closeStackPanel()
-        removeDimLayers()  // v8：Focus 期间暗色层撤掉（被停放窗口不在屏上）
-        hideHighlights()  // v9：Focus 期间高亮隐藏（单窗口模式没有间隙可画）
-        showToast("Focus · 再按 ⌃⌥Z 恢复")
+        removeDimLayers()
+        hideHighlights()
+        showToast("Focus · ⌃⌥Z to put it back", sticky: true, on: screen)
     }
 
     func disableFocus() {
-        let sh = mainHeight()
-        var restored = 0
-        for (el, f) in focusSaved {
-            setSize(el, f.size)
-            setPosition(el, CGPoint(x: f.minX, y: sh - f.maxY))
-            restored += 1
-        }
+        let saved = focusSaved
         focusSaved = []
         focusMode = false
+        tileHoldUntil = CACurrentMediaTime() + 0.6
+        var restored = 0
+        for (el, f, key) in saved {
+            placeFrame(el, f, key: key, animated: true)
+            restored += 1
+        }
         // 恢复是 best-effort：Focus 期间已关闭的窗口 AX 设置会静默失败
         log("focus off: restored frames for \(restored) windows (best-effort)")
         hideToast()  // Focus 退出时直接撤掉 pill，不新弹
@@ -3121,9 +3816,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         noPeekOn = on
         if on {
             refreshDimLayers()
+            for (_, p) in dimPanels {
+                p.alphaValue = 0
+                fadeWindow(p, to: 1, duration: 0.35, done: nil)
+            }
+            showToast("No peek mode on", detail: "Other windows fade back. ⌃⌥D to stop.")
             log("noPeek on (dim=\(dimLevel))")
         } else {
-            removeDimLayers()
+            let panels = Array(dimPanels.values)
+            for p in panels { fadeWindow(p, to: 0, duration: 0.25, done: nil) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { [weak self] in
+                guard let self, !self.noPeekOn else { return }
+                self.removeDimLayers()
+            }
+            showToast("No peek mode off", detail: "⌃⌥D to turn it on again.")
             log("noPeek off")
         }
     }
@@ -3141,6 +3847,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func refreshDimLayers() {
         guard noPeekOn, AXIsProcessTrusted(), autoTile, !focusMode, !cleanSpaceOn else {
+            let fading = Set(opacityFades.compactMap { $0.window.map { ObjectIdentifier($0) } })
+            if dimPanels.values.contains(where: { fading.contains(ObjectIdentifier($0)) }) { return }
             removeDimLayers()
             return
         }
@@ -3249,6 +3957,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         highlightPanels.removeAll()
     }
 
+    /// 停在所有屏幕包围盒的下方，竖着叠两块屏时也不会落到下面那块上。
+    func parkedBelowAllScreens(size: CGSize, near screen: NSScreen) -> CGRect {
+        let union = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
+        let width = max(size.width, 1)
+        let height = max(size.height, 1)
+        let x = screen.frame.midX - width / 2
+        let y = union.minY - height - 80
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
     func cleanBgColor() -> NSColor {
         // demo 对齐版：背景固定 graphite，不再分档
         return NSColor(calibratedRed: 0.11, green: 0.11, blue: 0.12, alpha: 1)
@@ -3278,26 +3996,34 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("cleanSpace skipped: no windows on this screen")
             return
         }
-        let sh = mainHeight()
-        cleanSaved = windows.compactMap { w in
-            guard let f = getFrame(w.element, screenHeight: sh) else { return nil }
-            return (w.element, f)
+        cleanSaved = windows.compactMap { w -> (AXUIElement, CGRect, String)? in
+            let key = winKey(w)
+            let f = lastPlacedFrames[key] ?? frameMotions[key]?.to ?? getFrame(w.element, screenHeight: mainHeight())
+            guard let f else { return nil }
+            return (w.element, f, key)
         }
-        let frontIdx = windows.firstIndex(where: { winKey($0) == winKey(frontAll) }) ?? 0
-        let front = windows[min(frontIdx, windows.count - 1)]
+        let frontKey = winKey(frontAll)
+        let front = windows.first(where: { winKey($0) == frontKey }) ?? windows[0]
         let vf = screen.visibleFrame
-        for (i, w) in windows.enumerated() {
-            if i == frontIdx { continue }  // demo 语义：活动窗口保持原磁贴 frame 不动，不放大到全屏
-            if let pt = getAXPosition(w.element) {
-                setPosition(w.element, CGPoint(x: -10000, y: pt.y))
-            }
-        }
         cleanSpaceOn = true
-        // 素色背景窗：桌面层级（在桌面之上、正常窗口之下），穿透点击
+        let margin: CGFloat = 48
+        let src = cleanSaved.first(where: { $0.key == frontKey })?.frame ?? front.frame
+        let fw = min(src.width, max(200, vf.width - margin * 2))
+        let fh = min(src.height, max(160, vf.height - margin * 2))
+        let centered = CGRect(x: vf.midX - fw / 2, y: vf.midY - fh / 2, width: fw, height: fh)
+        AXUIElementPerformAction(front.element, kAXRaiseAction as CFString)
+        placeFrame(front.element, centered, key: frontKey, animated: true)
+        for w in windows where winKey(w) != frontKey {
+            let key = winKey(w)
+            let cur = cleanSaved.first(where: { $0.key == key })?.frame ?? w.frame
+            placeFrame(w.element, parkedBelowAllScreens(size: cur.size, near: screen), key: key, animated: true)
+        }
+        // 桌面层级盖住壁纸，Dock 和菜单栏在更高层，仍然可见。
         if cleanBgPanel == nil {
-            let p = NSPanel(contentRect: vf, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let p = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
             p.backgroundColor = .clear
+            p.isOpaque = false
             p.hasShadow = false
             p.ignoresMouseEvents = true
             let v = NSView()
@@ -3307,29 +4033,33 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         cleanBgPanel?.contentView?.wantsLayer = true
         cleanBgPanel?.contentView?.layer?.backgroundColor = cleanBgColor().cgColor
-        cleanBgPanel?.setFrame(vf, display: true)
+        cleanBgPanel?.setFrame(screen.frame, display: true)
+        cleanBgPanel?.alphaValue = 0
         cleanBgPanel?.orderFront(nil)
+        if let bg = cleanBgPanel { fadeWindow(bg, to: 1, duration: 0.35, done: nil) }
         removeDimLayers()
         hideGrips()
         hideHoverBar()
         hideDotHandles()
         hideStackMarkers()
         closeStackPanel()
-        hideHighlights()  // v9：Clean Space 期间高亮隐藏
-        log("cleanSpace on: front=\(front.appName), \(windows.count - 1) windows parked")
+        hideHighlights()
+        log("cleanSpace on: front=\(front.appName), centered")
     }
 
     func disableCleanSpace() {
-        let sh = mainHeight()
-        var restored = 0
-        for (el, f) in cleanSaved {
-            setSize(el, f.size)
-            setPosition(el, CGPoint(x: f.minX, y: sh - f.maxY))
-            restored += 1
-        }
+        let saved = cleanSaved
         cleanSaved = []
         cleanSpaceOn = false
-        cleanBgPanel?.orderOut(nil)
+        tileHoldUntil = CACurrentMediaTime() + 0.6
+        var restored = 0
+        for (el, f, key) in saved {
+            placeFrame(el, f, key: key, animated: true)
+            restored += 1
+        }
+        if let bg = cleanBgPanel {
+            fadeWindow(bg, to: 0, duration: 0.25) { [weak bg] in bg?.orderOut(nil); bg?.alphaValue = 1 }
+        }
         log("cleanSpace off: restored frames for \(restored) windows (best-effort)")
         refreshDimLayers()
         refreshHighlights()  // v9：退出后高亮按当前模式恢复
@@ -3351,7 +4081,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func setupHotkeys() {
         guard shortcutsEnabled, !tapRunning else { return }
-        // D 批：同一 tap 再接鼠标按下/拖动/松开，用于 ⌘拖交换与 ⌥⌘拖进堆叠；
+        // D 批：同一 tap 再接鼠标按下/拖动/松开，用于 ⌘拖交换与 ⌃⌘拖进堆叠；
         // 非拖动模式的鼠标事件一律原样放行
         let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
             | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
@@ -3490,8 +4220,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let topA = stacks[active][min(stackTops[stackTopKey(sid, active)] ?? 0, stacks[active].count - 1)]
         let topB = stacks[nb][min(stackTops[stackTopKey(sid, nb)] ?? 0, stacks[nb].count - 1)]
-        guard let ia = windowOrder.firstIndex(of: winKey(topA)),
-              let ib = windowOrder.firstIndex(of: winKey(topB)) else { return }
+        let keyA = winKey(topA)
+        let keyB = winKey(topB)
+        guard let ia = windowOrder.firstIndex(of: keyA),
+              let ib = windowOrder.firstIndex(of: keyB) else { return }
+        exchangeStackRoles(keyA, keyB)
         windowOrder.swapAt(ia, ib)
         log("swap tile \(active) <-> \(nb): \(topA.appName) <-> \(topB.appName)")
         forceTile()
@@ -3546,7 +4279,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshPanel()
     }
 
-    // MARK: - D 批 ⌘拖交换 / ⌥⌘拖进堆叠
+    // MARK: - D 批 ⌘拖交换 / ⌃⌘拖进堆叠
 
     // CGEvent 坐标是 Quartz 系（左上原点、y 向下），转成 Cocoa 系（左下原点、y 向上）
     func cocoaPoint(fromQuartz q: CGPoint) -> CGPoint? {
@@ -3588,7 +4321,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vf = screen.visibleFrame
         let frames = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: vf, st: settingsFor(screen)), tileCount: stacks.count, vf: vf, st: settingsFor(screen), sid: sid)
         guard let src = frames.firstIndex(where: { $0.contains(p) }) else { return false }
-        let mode: DragMode = flags.contains(.maskAlternate) ? .stack : .swap
+        // ⌘ 交换；⌃⌘ 加入堆叠。⌥⌘ 不再当堆叠（与 Shoji 的 Control-Command 一致）。
+        let mode: DragMode = flags.contains(.maskControl) ? .stack : .swap
         // 当前栈顶（不用 stacks[].first，也不依赖可能滞后的 lastTilesByScreen）
         let top = stacks[src][min(stackTops[stackTopKey(sid, src)] ?? 0, stacks[src].count - 1)]
         pendingDrag = DragState(mode: mode, sourceTile: src, draggedKey: winKey(top), frames: frames, screenID: sid)
@@ -3674,8 +4408,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         dragRingPanel?.orderOut(nil)
     }
 
-    // 拖动交换：整格对调，与 ⌃⌥方向交换同一语义（堆叠跟随栈顶窗口走）；
-    // 拖动开始认的窗口（draggedKey）与落点换的窗口必须是同一个
+    // 拖动交换：对调两扇窗口。堆在同一磁贴里的其余窗口留在原磁贴，改跟新来的那扇。
     func performDragSwap(from src: Int, to dst: Int, screenID sid: CGDirectDisplayID, draggedKey: String) {
         guard AXIsProcessTrusted(), !focusMode, !cleanSpaceOn else { return }
         let screen = NSScreen.screens.first(where: { screenID($0) == sid }) ?? NSScreen.main ?? NSScreen.screens[0]
@@ -3687,16 +4420,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let w = windows.first(where: { winKey($0) == draggedKey }) { topA = w }
         else { topA = stacks[src][min(stackTops[stackTopKey(sid, src)] ?? 0, stacks[src].count - 1)] }
         let topB = stacks[dst][min(stackTops[stackTopKey(sid, dst)] ?? 0, stacks[dst].count - 1)]
-        guard let ia = windowOrder.firstIndex(of: winKey(topA)),
-              let ib = windowOrder.firstIndex(of: winKey(topB)) else { return }
+        let keyA = winKey(topA)
+        let keyB = winKey(topB)
+        guard let ia = windowOrder.firstIndex(of: keyA),
+              let ib = windowOrder.firstIndex(of: keyB) else { return }
+        exchangeStackRoles(keyA, keyB)
         windowOrder.swapAt(ia, ib)
         log("drag swap tile \(src) <-> \(dst): \(topA.appName) <-> \(topB.appName)")
         forceTile()
         refreshPanel()
     }
 
-    // 拖动进堆叠：被拖窗口移到顺序末尾（超量区），并 pin 住目标磁贴为活动磁贴，
-    // 再把被拖窗口 raise 到该磁贴最上层，成为该磁贴的活动窗口
+    // 拖动进堆叠：被拖窗口并进目标磁贴（满格也并，原格子收掉重排），
+    // 再把它 raise 到该磁贴最上层。目标磁贴 pin 到切走前台 App 为止。
     func performDragStack(draggedKey: String, to dst: Int, screenID sid: CGDirectDisplayID) {
         guard AXIsProcessTrusted(), !focusMode, !cleanSpaceOn else { return }
         let screen = NSScreen.screens.first(where: { screenID($0) == sid }) ?? NSScreen.main ?? NSScreen.screens[0]
@@ -3708,14 +4444,37 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("drag stack skipped: dragged window gone")
             return
         }
+        guard let src = stacks.firstIndex(where: { $0.contains { winKey($0) == draggedKey } }) else {
+            log("drag stack skipped: source tile gone")
+            return
+        }
+        guard src != dst else { return }
+        let destTop = stacks[dst][min(stackTops[stackTopKey(sid, dst)] ?? 0, stacks[dst].count - 1)]
+        let destKey = winKey(destTop)
+        guard destKey != draggedKey else { return }
+        let remaining = stacks[src].filter { winKey($0) != draggedKey }
+        if let newRoot = remaining.first(where: { stackedOnto[winKey($0)] == nil }) ?? remaining.first {
+            let nr = winKey(newRoot)
+            stackedOnto.removeValue(forKey: nr)
+            let pointing = stackedOnto.filter { $0.value == draggedKey && $0.key != nr }.map { $0.key }
+            for m in pointing { stackedOnto[m] = nr }
+        } else {
+            for m in stackedOnto.filter({ $0.value == draggedKey }).map({ $0.key }) {
+                stackedOnto.removeValue(forKey: m)
+            }
+        }
+        stackedOnto[draggedKey] = destKey
+        if stackedOnto[destKey] == draggedKey { stackedOnto.removeValue(forKey: destKey) }
+        normalizeStackedOnto(liveKeys: Set(windows.map { winKey($0) }))
         windowOrder.removeAll { $0 == draggedKey }
         windowOrder.append(draggedKey)
-        pinnedActiveTile = dst
-        pinnedScreenID = sid
-        pinnedFrontmostPid = w.pid
-        let (stacks2, _) = computeTiles(windows: collectWindows(on: screen), st: settingsFor(screen), sid: sid)
-        if dst < stacks2.count, let idx = stacks2[dst].firstIndex(where: { winKey($0) == draggedKey }) {
-            stackTops[stackTopKey(sid, dst)] = idx
+        let (stacks2, _) = computeTiles(windows: windows, st: settingsFor(screen), sid: sid)
+        if let ti = stacks2.firstIndex(where: { $0.contains { winKey($0) == draggedKey } }),
+           let idx = stacks2[ti].firstIndex(where: { winKey($0) == draggedKey }) {
+            stackTops[stackTopKey(sid, ti)] = idx
+            pinnedActiveTile = ti
+            pinnedScreenID = sid
+            pinnedFrontmostPid = w.pid
         }
         AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
         if let app = NSRunningApplication(processIdentifier: w.pid) { app.activate() }
@@ -3735,6 +4494,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("hotkey: already primary (\(w.appName))")
             return
         }
+        stackedOnto.removeValue(forKey: key)
         primaryKey = key
         log("hotkey: primary -> \(w.appName)")
         forceTile()
@@ -3880,36 +4640,114 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    final class TabMinimapView: NSView {
+        struct Item {
+            var tile: Int
+            var unit: CGRect
+            var icon: NSImage?
+            var name: String
+            var selected: Bool
+        }
+        var items: [Item] = []
+        var onPick: ((Int) -> Void)?
+        override func draw(_ dirtyRect: NSRect) {
+            for item in items {
+                let r = NSRect(
+                    x: bounds.minX + item.unit.minX * bounds.width,
+                    y: bounds.minY + (1 - item.unit.maxY) * bounds.height,
+                    width: max(4, item.unit.width * bounds.width),
+                    height: max(4, item.unit.height * bounds.height)
+                ).insetBy(dx: 5, dy: 5)
+                let path = NSBezierPath(roundedRect: r, xRadius: 10, yRadius: 10)
+                NSColor(white: 0.22, alpha: 1).setFill()
+                path.fill()
+                if item.selected {
+                    NSColor.controlAccentColor.setStroke()
+                    path.lineWidth = 3
+                    path.stroke()
+                }
+                if let icon = item.icon {
+                    let side = min(40, max(12, min(r.width, r.height) * 0.38))
+                    icon.draw(in: NSRect(x: r.midX - side / 2, y: r.midY - side / 2 + 6, width: side, height: side))
+                }
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                    .foregroundColor: NSColor.white,
+                ]
+                let name = item.name as NSString
+                let size = name.size(withAttributes: attrs)
+                let textW = min(size.width, max(0, r.width - 8))
+                name.draw(in: NSRect(x: r.midX - textW / 2, y: r.minY + 6, width: textW, height: 14), withAttributes: attrs)
+            }
+        }
+        override func mouseDown(with event: NSEvent) {
+            let p = convert(event.locationInWindow, from: nil)
+            for item in items {
+                let r = NSRect(
+                    x: bounds.minX + item.unit.minX * bounds.width,
+                    y: bounds.minY + (1 - item.unit.maxY) * bounds.height,
+                    width: item.unit.width * bounds.width,
+                    height: item.unit.height * bounds.height
+                )
+                if r.contains(p) { onPick?(item.tile); return }
+            }
+        }
+    }
+
+    func collectMinimized() -> [WinInfo] {
+        var out: [WinInfo] = []
+        let myPid = ProcessInfo.processInfo.processIdentifier
+        let mh = mainHeight()
+        for app in NSWorkspace.shared.runningApplications {
+            guard app.activationPolicy == .regular, app.processIdentifier != myPid else { continue }
+            if let bid = app.bundleIdentifier, excludedBundles.contains(bid) { continue }
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &value) == .success,
+                  let wins = value as? [AXUIElement] else { continue }
+            for w in wins {
+                guard boolAttr(w, kAXMinimizedAttribute as CFString) else { continue }
+                let title = stringAttr(w, kAXTitleAttribute as CFString) ?? ""
+                let frame = getFrame(w, screenHeight: mh) ?? .zero
+                out.append(WinInfo(pid: app.processIdentifier, appName: app.localizedName ?? "?", element: w, title: title, frame: frame))
+            }
+        }
+        return out
+    }
+
     func showTabView() {
         guard AXIsProcessTrusted() else { log("tab view skipped: not trusted"); return }
         closeTabView()
         let windows = collectWindows()
         guard !windows.isEmpty else { log("tab view skipped: no windows"); return }
-        // C 批：列出全部屏的被平铺窗口，按屏分组；多屏时屏切换处插屏名小节标题行
-        let multiScreen = NSScreen.screens.count > 1
-        var grouped: [(name: String, rows: [(win: WinInfo, tile: Int, pos: Int, sid: CGDirectDisplayID)])] = []
+        tabFrames = [:]
+        var rows: [(win: WinInfo, tile: Int, pos: Int, sid: CGDirectDisplayID)] = []
         for s in NSScreen.screens {
             let sid = screenID(s)
             let wins = collectWindows(on: s)
             guard !wins.isEmpty else { continue }
-            let (stacks, _) = computeTiles(windows: wins, st: settingsFor(s), sid: sid)
-            var grows: [(win: WinInfo, tile: Int, pos: Int, sid: CGDirectDisplayID)] = []
-            for (ti, st2) in stacks.enumerated() {
-                for (pos, w) in st2.enumerated() { grows.append((w, ti, pos, sid)) }
+            let st = settingsFor(s)
+            let (stacks, _) = computeTiles(windows: wins, st: st, sid: sid)
+            let vf = s.visibleFrame
+            let computed = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: vf, st: st), tileCount: stacks.count, vf: vf, st: st, sid: sid)
+            let live = lastTilesByScreen[sid]
+            let frames = (live?.count == stacks.count) ? live!.map { $0.frame } : computed
+            for (ti, stack) in stacks.enumerated() {
+                if ti < frames.count { tabFrames["\(sid):\(ti)"] = frames[ti] }
+                for (pos, w) in stack.enumerated() {
+                    rows.append((w, ti, pos, sid))
+                }
             }
-            if !grows.isEmpty { grouped.append((screenName(s), grows)) }
         }
-        let rows = grouped.flatMap { $0.rows }
         guard !rows.isEmpty else { log("tab view skipped: no windows"); return }
         tabRows = rows
-        if let fi = frontmostIndex(windows: windows) {
+        if let fi = focusedIndex(windows: windows) ?? frontmostIndex(windows: windows) {
             let fk = winKey(windows[fi])
             tabSelected = rows.firstIndex(where: { winKey($0.win) == fk }) ?? 0
         } else {
             tabSelected = 0
         }
-        let headerCount = multiScreen ? grouped.count : 0
-        let panel = TabKeyPanel(contentRect: NSRect(x: 0, y: 0, width: 460, height: min(CGFloat(56 + rows.count * 34 + headerCount * 22), 520)),
+        let panel = TabKeyPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 460),
                                 styleMask: [.borderless], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .floating
@@ -3917,78 +4755,178 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.isOpaque = false
         panel.hasShadow = true
         panel.delegate = self
-        let bg = NSVisualEffectView()
-        bg.material = .hudWindow
-        bg.state = .active
+        let bg = NSView()
         bg.wantsLayer = true
-        bg.layer?.cornerRadius = 12
-        bg.translatesAutoresizingMaskIntoConstraints = false
-        let doc = NSStackView()
-        doc.orientation = .vertical
-        doc.spacing = 2
-        doc.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-        doc.translatesAutoresizingMaskIntoConstraints = false
-        tabRowViews = []
-        var rowIndex = 0
-        for g in grouped {
-            if multiScreen {
-                let h = NSTextField(labelWithString: g.name)
-                h.font = .systemFont(ofSize: 11, weight: .semibold)
-                h.textColor = .secondaryLabelColor
-                doc.addArrangedSubview(h)
-            }
-            for r in g.rows {
-                let i = rowIndex; rowIndex += 1
-                let icon = NSRunningApplication(processIdentifier: r.win.pid)?.bundleURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
-                let row = TabRowView(icon: icon, text: "\(r.win.appName) — \(r.win.title)  · 磁贴 \(r.tile + 1)\(r.pos > 0 ? "（堆叠）" : "")")
-                row.isSelected = (i == tabSelected)
-                row.onClick = { [weak self] in self?.activateTabRow(i) }
-                doc.addArrangedSubview(row)
-                tabRowViews.append(row)
-            }
-        }
-        let scroll = NSScrollView()
-        scroll.hasVerticalScroller = true
-        scroll.drawsBackground = false
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.documentView = doc
-        bg.addSubview(scroll)
+        bg.layer?.backgroundColor = NSColor(srgbRed: 0x16 / 255, green: 0x16 / 255, blue: 0x1a / 255, alpha: 0.96).cgColor
+        bg.layer?.cornerRadius = 18
+        let title = NSTextField(labelWithString: "")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.textColor = .white
+        title.alignment = .center
+        let detail = NSTextField(labelWithString: "")
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = NSColor.white.withAlphaComponent(0.85)
+        detail.alignment = .center
+        let minimized = NSTextField(labelWithString: "Nothing minimized")
+        minimized.font = .systemFont(ofSize: 11)
+        minimized.textColor = NSColor.white.withAlphaComponent(0.55)
+        minimized.alignment = .center
+        let footer = NSTextField(labelWithString: "Tab next · ⇧Tab back · arrows move · let go of ⌥ to switch · Esc")
+        footer.font = .systemFont(ofSize: 11)
+        footer.textColor = NSColor.white.withAlphaComponent(0.7)
+        footer.alignment = .center
+        let map = TabMinimapView()
+        map.onPick = { [weak self] tile in self?.pickTabTile(tile) }
+        tabMinimap = map
+        tabTitleField = title
+        tabDetailField = detail
+        tabMinField = minimized
+        let stack = NSStackView(views: [title, map, detail, minimized, footer])
+        stack.orientation = .vertical
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 14, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        map.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(stack)
         panel.contentView = bg
         NSLayoutConstraint.activate([
-            bg.leadingAnchor.constraint(equalTo: panel.contentView!.leadingAnchor),
-            bg.trailingAnchor.constraint(equalTo: panel.contentView!.trailingAnchor),
-            bg.topAnchor.constraint(equalTo: panel.contentView!.topAnchor),
-            bg.bottomAnchor.constraint(equalTo: panel.contentView!.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: bg.topAnchor),
-            scroll.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
-            doc.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor, constant: -16),
+            stack.leadingAnchor.constraint(equalTo: bg.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: bg.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: bg.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bg.bottomAnchor),
+            map.heightAnchor.constraint(equalToConstant: 280),
         ])
         tabPanel = panel
-        let centerScreen = activeScreen()
+        renderTabMinimap()
+        let centerScreen = tabRows.indices.contains(tabSelected)
+            ? (NSScreen.screens.first { self.screenID($0) == self.tabRows[self.tabSelected].sid } ?? activeScreen())
+            : activeScreen()
         let vf = centerScreen.visibleFrame
-        let f = panel.frame
-        panel.setFrameOrigin(NSPoint(x: vf.midX - f.width / 2, y: vf.midY - f.height / 2))
+        panel.setFrameOrigin(NSPoint(x: vf.midX - 280, y: vf.midY - 230))
         tabKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self, self.tabPanel?.isVisible == true else { return event }
+            let shift = event.modifierFlags.contains(.shift)
             switch event.keyCode {
-            case 126: self.selectTabRow(self.tabSelected - 1); return nil
-            case 125, 48: self.selectTabRow(self.tabSelected + 1); return nil
+            case 126: self.moveTab(dx: 0, dy: 1); return nil
+            case 125: self.moveTab(dx: 0, dy: -1); return nil
+            case 123: self.moveTab(dx: -1, dy: 0); return nil
+            case 124: self.moveTab(dx: 1, dy: 0); return nil
+            case 48: self.cycleTab(shift ? -1 : 1); return nil
             case 36: self.activateTabRow(self.tabSelected); return nil
             case 53: self.closeTabView(); return nil
             default: return event
             }
         }
+        tabFlagLocal = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.noteTabFlags(event.modifierFlags)
+            return event
+        }
+        tabFlagGlobal = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.noteTabFlags(event.modifierFlags)
+        }
         panel.makeKeyAndOrderFront(nil)
         log("tab view shown: \(rows.count) windows")
     }
 
+    func renderTabMinimap() {
+        guard let map = tabMinimap, tabRows.indices.contains(tabSelected) else { return }
+        let sid = tabRows[tabSelected].sid
+        guard let screen = NSScreen.screens.first(where: { screenID($0) == sid }) else { return }
+        let vf = screen.visibleFrame
+        var seen: [Int: TabMinimapView.Item] = [:]
+        var order: [Int] = []
+        for (idx, r) in tabRows.enumerated() where r.sid == sid {
+            let frame = tabFrames["\(sid):\(r.tile)"] ?? .zero
+            let unit = CGRect(
+                x: vf.width > 1 ? (frame.minX - vf.minX) / vf.width : 0,
+                y: vf.height > 1 ? (vf.maxY - frame.maxY) / vf.height : 0,
+                width: vf.width > 1 ? frame.width / vf.width : 1,
+                height: vf.height > 1 ? frame.height / vf.height : 1
+            )
+            let selected = idx == tabSelected
+            if seen[r.tile] == nil {
+                order.append(r.tile)
+                let icon = NSRunningApplication(processIdentifier: r.win.pid)?.bundleURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
+                seen[r.tile] = TabMinimapView.Item(tile: r.tile, unit: unit, icon: icon, name: r.win.appName, selected: selected)
+            } else if selected, var item = seen[r.tile] {
+                item.selected = true
+                item.name = r.win.appName
+                item.icon = NSRunningApplication(processIdentifier: r.win.pid)?.bundleURL.map { NSWorkspace.shared.icon(forFile: $0.path) }
+                seen[r.tile] = item
+            }
+        }
+        if tabRows[tabSelected].sid == sid, let tile = seen[tabRows[tabSelected].tile] {
+            var marked = tile
+            marked.selected = true
+            seen[tabRows[tabSelected].tile] = marked
+        }
+        map.items = order.compactMap { seen[$0] }
+        map.needsDisplay = true
+        let count = tabRows.filter { $0.sid == sid }.count
+        let display = screen.localizedName.isEmpty ? screenName(screen) : screen.localizedName
+        tabTitleField?.stringValue = "\(display) · \(count) window\(count == 1 ? "" : "s")"
+        let current = tabRows[tabSelected]
+        tabDetailField?.stringValue = "\(current.win.appName) · \(screenName(screen))"
+        let mins = collectMinimized().filter { w in
+            if w.frame.width < 2 || w.frame.height < 2 { return screenID(screen) == screenID(NSScreen.main ?? screen) }
+            return screenID(screenForFrame(w.frame)) == sid
+        }
+        tabMinField?.stringValue = mins.isEmpty ? "Nothing minimized" : mins.map { $0.appName }.joined(separator: ", ")
+    }
+
+    func pickTabTile(_ tile: Int) {
+        guard tabRows.indices.contains(tabSelected) else { return }
+        let sid = tabRows[tabSelected].sid
+        let top = stackTops[stackTopKey(sid, tile)] ?? 0
+        if let idx = tabRows.firstIndex(where: { $0.sid == sid && $0.tile == tile && $0.pos == top })
+            ?? tabRows.firstIndex(where: { $0.sid == sid && $0.tile == tile }) {
+            selectTabRow(idx)
+        }
+    }
+
+    func cycleTab(_ dir: Int) {
+        guard !tabRows.isEmpty else { return }
+        let n = tabRows.count
+        selectTabRow((tabSelected + dir + n) % n)
+    }
+
+    func moveTab(dx: Int, dy: Int) {
+        guard tabRows.indices.contains(tabSelected) else { return }
+        let cur = tabRows[tabSelected]
+        let a = tabFrames["\(cur.sid):\(cur.tile)"] ?? .zero
+        var best: Int?
+        var bestD = CGFloat.greatestFiniteMagnitude
+        var seenTiles: Set<Int> = []
+        for (i, r) in tabRows.enumerated() where r.sid == cur.sid && r.tile != cur.tile && seenTiles.insert(r.tile).inserted {
+            let f = tabFrames["\(r.sid):\(r.tile)"] ?? .zero
+            let vOverlap = min(a.maxY, f.maxY) - max(a.minY, f.minY)
+            let hOverlap = min(a.maxX, f.maxX) - max(a.minX, f.minX)
+            var d: CGFloat = -1
+            if dx == 1, f.midX > a.midX + 8, vOverlap > 8 { d = f.midX - a.midX }
+            if dx == -1, f.midX < a.midX - 8, vOverlap > 8 { d = a.midX - f.midX }
+            if dy == 1, f.midY > a.midY + 8, hOverlap > 8 { d = f.midY - a.midY }
+            if dy == -1, f.midY < a.midY - 8, hOverlap > 8 { d = a.midY - f.midY }
+            if d >= 0, d < bestD {
+                bestD = d
+                let top = stackTops[stackTopKey(r.sid, r.tile)] ?? 0
+                best = tabRows.firstIndex(where: { $0.sid == r.sid && $0.tile == r.tile && $0.pos == top }) ?? i
+            }
+        }
+        if let best { selectTabRow(best) }
+    }
+
+    func noteTabFlags(_ flags: NSEvent.ModifierFlags) {
+        guard tabPanel != nil else { return }
+        if !flags.contains(.option) {
+            activateTabRow(tabSelected)
+        }
+    }
+
     func selectTabRow(_ idx: Int) {
         guard !tabRows.isEmpty else { return }
-        tabSelected = min(max(idx, 0), tabRows.count - 1)
-        for (i, v) in tabRowViews.enumerated() { v.isSelected = (i == tabSelected) }
-        _ = tabRowViews[tabSelected].scrollToVisible(tabRowViews[tabSelected].bounds)
+        let n = tabRows.count
+        tabSelected = (idx % n + n) % n
+        renderTabMinimap()
     }
 
     func activateTabRow(_ idx: Int) {
@@ -4005,9 +4943,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func closeTabView() {
         if let m = tabKeyMonitor { NSEvent.removeMonitor(m); tabKeyMonitor = nil }
+        if let m = tabFlagLocal { NSEvent.removeMonitor(m); tabFlagLocal = nil }
+        if let m = tabFlagGlobal { NSEvent.removeMonitor(m); tabFlagGlobal = nil }
         tabPanel?.close()
         tabPanel = nil
         tabRowViews = []
+        tabMinimap = nil
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -4047,11 +4988,30 @@ func hotkeyTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
         delegate.dragCancel()
         return nil
     }
-    // Tab View 打开时按键交给面板自己的本地监听处理，tap 只放行
-    if delegate.tabPanel?.isVisible == true { return Unmanaged.passUnretained(event) }
-    guard delegate.shortcutsEnabled, delegate.tapRunning else { return Unmanaged.passUnretained(event) }
     let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
     let flags = event.flags
+    // Tab View 开着时：Tab / 方向键 / Esc 留在切换器里，不交给系统的 App 切换。
+    if delegate.tabPanel?.isVisible == true {
+        if keyCode == 48, flags.contains(.maskAlternate) {
+            delegate.cycleTab(flags.contains(.maskShift) ? -1 : 1)
+            return nil
+        }
+        if keyCode == 53 { delegate.closeTabView(); return nil }
+        switch keyCode {
+        case 123: delegate.moveTab(dx: -1, dy: 0); return nil
+        case 124: delegate.moveTab(dx: 1, dy: 0); return nil
+        case 125: delegate.moveTab(dx: 0, dy: -1); return nil
+        case 126: delegate.moveTab(dx: 0, dy: 1); return nil
+        default: return Unmanaged.passUnretained(event)
+        }
+    }
+    // Settings ⌘, 只在 TileProto 自己在前台时接管，别的 App 的偏好设置照常打开。
+    if keyCode == 43, flags.contains(.maskCommand), !flags.contains(.maskControl),
+       !flags.contains(.maskAlternate), !flags.contains(.maskShift),
+       NSRunningApplication.current.isActive {
+        delegate.openSettings(select: "General")
+        return nil
+    }
     // ⌥⇥ 打开 Tab View 时吞掉这次按键，避免绑定 Option-Tab 的应用双重生效
     if keyCode == 48, flags.contains(.maskAlternate), !flags.contains(.maskControl),
        !flags.contains(.maskCommand), !flags.contains(.maskShift) {
