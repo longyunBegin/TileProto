@@ -281,6 +281,13 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var dragState: DragState? = nil
     var pendingDrag: DragState? = nil  // ⌘按下未移动时的待定拖动：不吞事件，移动超 3pt 才转正
     var pendingDragPoint: CGPoint = .zero
+    // 抓后按 ⌘：按下时没按 ⌘，记下按下点，拖动中按住 ⌘时从按下点重建拖动。
+    var plainDownPoint: CGPoint? = nil
+    var plainDownScreenID: CGDirectDisplayID? = nil
+    // mouse tap 重试退避（2s/5s/10s/30s，最多 4 次）；成功或授权翻转时重置。
+    var tapRetryAttempt = 0
+    var tapNextRetryAt: Date? = nil
+    var tapRetryToastShown = false
     var dragRingPanel: NSPanel? = nil
     var pinnedActiveTile: Int? = nil
     var pinnedFrontmostPid: pid_t? = nil
@@ -639,6 +646,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 statusDot.color = .systemGray
                 statusLabel.stringValue = "Tiling off"
             }
+            if autoTile && !stageManagerPaused && !tapRunning {
+                statusLabel.stringValue += " · ⌘ 拖暂不可用"
+            }
             tilesPlaceholder.isHidden = !stacks.isEmpty
             tilesStack.isHidden = stacks.isEmpty
             if !stacks.isEmpty {
@@ -906,6 +916,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 : "NOT TRUSTED: tiling disabled, re-grant in System Settings > Privacy & Security > Accessibility")
             if trusted {
                 mouseTapFailedLogged = false
+                tapRetryAttempt = 0; tapNextRetryAt = nil; tapRetryToastShown = false
                 setupMouseDragTap()
             }
         }
@@ -929,6 +940,27 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             closeStackPanel()
             return
         }
+        // mouse tap 重试：创建失败时按短退避重试几次（2s/5s/10s/30s），
+        // 而不是只在授权翻转时试一次；否则启动竞态失败后 ⌘ 拖会静默失效到下次重启。
+        // 重试耗尽时发一次 toast；面板状态行也会同步提示（见 refreshPanel）。
+        if !tapRunning {
+            if let next = tapNextRetryAt {
+                if Date() >= next, tapRetryAttempt < 4 {
+                    tapRetryAttempt += 1
+                    tapNextRetryAt = Date().addingTimeInterval([2, 5, 10, 30][min(tapRetryAttempt - 1, 3)])
+                    setupMouseDragTap()
+                    if tapRunning {
+                        tapRetryAttempt = 0; tapNextRetryAt = nil; tapRetryToastShown = false
+                    } else if tapRetryAttempt >= 4, !tapRetryToastShown {
+                        tapRetryToastShown = true
+                        showToast("⌘ 拖交换暂不可用", detail: "鼠标 tap 未建立，重开应用或检查 Input Monitoring 后再试。", on: NSScreen.main ?? NSScreen.screens.first)
+                    }
+                }
+            } else {
+                tapNextRetryAt = Date().addingTimeInterval(2)
+            }
+        }
+
         // pin 住的目标磁贴在用户切到别的 App 时放开，并重排一次。
         // 专注屏上 tile() 保持铺满，不把那扇窗口拉回格子。
         if pinnedActiveTile != nil, let pp = pinnedFrontmostPid,
@@ -2020,6 +2052,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         override func draw(_ dirtyRect: NSRect) {}
         override func mouseDown(with event: NSEvent) { onDrag?(self, 0, 0) }
+        // 面板平时不是 key window；首击也必须送达，否则缝手柄永远拖不起来。
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func mouseDragged(with event: NSEvent) {
             let m = NSEvent.mouseLocation
             onDrag?(self, 1, divider.vertical ? m.x : m.y)
@@ -2084,6 +2118,28 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                                 hi = min(hi, t.frame.maxY - max(minSize.height, 120) - 4)
                                             } else if abs(t.frame.maxY - (cur.center - 4)) < 1.5 {
                                                 lo = max(lo, t.frame.minY + max(minSize.height, 120) + 4)
+                                            }
+                                        }
+                                    }
+                                    // 实际帧顶回：已学尺寸为 0 或未学时，上面按 160/120 的钳制拦不住
+                                    // 真实最小尺寸更大的窗口——窗口会被系统按真实下限顶住而盖住邻居。
+                                    // 直接读两侧顶部窗口的实际帧：若某侧实际帧已超出当前格子（顶住了），
+                                    // 就把缝顶回到实际边，缝跟手停在真实下限上。动画中的窗口跳过
+                                    // （弹簧过冲会误判），等它落稳再顶。
+                                    for t in tiles {
+                                        guard self.frameMotions[self.winKey(t.top)] == nil,
+                                              let actual = self.getFrame(t.top.element, screenHeight: self.mainHeight()) else { continue }
+                                        if dd.vertical {
+                                            if abs(t.frame.maxX - (cur.center - 4)) < 1.5, actual.maxX > t.frame.maxX + 4 {
+                                                lo = max(lo, actual.maxX + 4)
+                                            } else if abs(t.frame.minX - (cur.center + 4)) < 1.5, actual.minX < t.frame.minX - 4 {
+                                                hi = min(hi, actual.minX - 4)
+                                            }
+                                        } else {
+                                            if abs(t.frame.minY - (cur.center + 4)) < 1.5, actual.minY < t.frame.minY - 4 {
+                                                hi = min(hi, actual.minY - 4)
+                                            } else if abs(t.frame.maxY - (cur.center - 4)) < 1.5, actual.maxY > t.frame.maxY + 4 {
+                                                lo = max(lo, actual.maxY + 4)
                                             }
                                         }
                                     }
@@ -2255,6 +2311,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         override func mouseDown(with event: NSEvent) { onClick?() }
+        // 面板平时不是 key window；首击也必须送达，否则握把点按时灵时不灵。
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     }
 
     func stackGripWidth(count: Int) -> CGFloat {
@@ -2563,7 +2621,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshPanel()
     }
 
-    // 悬浮窗口最小悬停条：Tile（点按重新进入平铺并重算，不是精确恢复）+ disabled 的 Primary/Focus。
+    // 悬浮窗口最小悬停条：只有 Tile（点按重新进入平铺并重算，不是精确恢复）；
+    // 灰掉的 Primary/Focus 会让整条看起来像坏了，故不画。
     func showFloatedHoverBar(screen: NSScreen, floated: WinInfo) {
         guard hoverPanel != nil else { return }
         hoverSid = screenID(screen)
@@ -2575,8 +2634,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         row.edgeInsets = NSEdgeInsets(top: 3, left: 8, bottom: 3, right: 8)
         row.translatesAutoresizingMaskIntoConstraints = false
         row.addArrangedSubview(hoverChip("Tile", tag: 0, action: #selector(hoverTileBack(_:)), emphasized: false))
-        row.addArrangedSubview(hoverChip("Primary", tag: 0, action: #selector(hoverPrimary(_:)), emphasized: false, enabled: false))
-        row.addArrangedSubview(hoverChip("Focus", tag: 0, action: #selector(hoverFocus(_:)), emphasized: false, enabled: false))
         let pill = hoverBarView ?? NSView()
         for v in pill.subviews { v.removeFromSuperview() }
         pill.addSubview(row)
@@ -2658,7 +2715,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for (sid, tiles) in lastTilesByScreen {
             guard let screen = NSScreen.screens.first(where: { screenID($0) == sid }) else { continue }
             for (i, t) in tiles.enumerated() {
-                let zone = CGRect(x: t.frame.minX, y: t.frame.maxY - 20, width: t.frame.width, height: 36)
+                let zone = CGRect(x: t.frame.minX, y: t.frame.maxY - 24, width: t.frame.width, height: 44)
                 guard zone.contains(m) else { continue }
                 let score = abs(m.y - t.frame.maxY)
                 if score < bestScore { bestScore = score; best = (sid, i, t, screen) }
@@ -2679,7 +2736,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let fk = focusKey, let fsid = focusScreen,
            let screen = NSScreen.screens.first(where: { screenID($0) == fsid }) {
             let vf = screen.visibleFrame
-            let zone = CGRect(x: vf.minX, y: vf.maxY - 20, width: vf.width, height: 36)
+            let zone = CGRect(x: vf.minX, y: vf.maxY - 24, width: vf.width, height: 44)
             let barFrame = (hoverPanel?.frame ?? .zero).insetBy(dx: -8, dy: -8)
             if zone.contains(m) || (hoverBarKind == 1 && hoverKey != nil && barFrame.contains(m)) {
                 if hoverBarKind != 1 || hoverKey == nil {
@@ -2693,7 +2750,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if hoverKey != nil {
             let barFrame = (hoverPanel?.frame ?? .zero).insetBy(dx: -8, dy: -8)
-            if barFrame.contains(m) { return }
+            if barFrame.contains(m) {
+                // 后建的握把/标记/暗色层不得盖住条：悬停期间把条顶回最前。
+                hoverPanel?.orderFront(nil)
+                return
+            }
             // 悬浮条：指针仍在悬浮窗口上沿（live 帧，窗口可被拖动）才保留。
             if hoverBarKind == 2 {
                 if let el = hoverFloatElement, let f = getFrame(el, screenHeight: mainHeight()) {
@@ -2716,7 +2777,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !floatedKeys.isEmpty,
                let fw = collectWindows(includeFloated: true).first(where: {
                    floatedKeys.contains(winKey($0)) &&
-                   CGRect(x: $0.frame.minX, y: $0.frame.maxY - 20, width: $0.frame.width, height: 36).contains(m)
+                   CGRect(x: $0.frame.minX, y: $0.frame.maxY - 24, width: $0.frame.width, height: 44).contains(m)
                }) {
                 let id = "float:\(winKey(fw))"
                 if hoverZoneID != id {
@@ -3006,10 +3067,17 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         let current = collectWindows(on: screen)
-        let currentKeys = Set(current.map { winKey($0) })
-        if currentKeys == Set(savedFrames.keys) {
+        // 集合判等只看 pid 多重集：标题常变（浏览器/聊天应用），标题一变就误判“集合变了”。
+        let pidOfKey: (String) -> String = { String($0.split(separator: "|", maxSplits: 1).first ?? "") }
+        let setUnchanged = current.map { pidOfKey(winKey($0)) }.sorted() == savedFrames.keys.map(pidOfKey).sorted()
+        if setUnchanged {
             // 精确恢复：只有专注窗口动过（铺满），把它放回保存帧；其余窗口 Focus 期间没动过。
-            if let fw = current.first(where: { winKey($0) == fk }), let frame = savedFrames[fk] {
+            // 专注窗口按 pid 兜底：标题变了也要还原它；同 pid 多窗时取帧最接近可见区的（即铺满的那扇）。
+            let vf = screen.visibleFrame
+            let fw = current.first(where: { winKey($0) == fk })
+                ?? current.filter { pidOfKey(winKey($0)) == pidOfKey(fk) }
+                    .min(by: { abs($0.frame.width - vf.width) + abs($0.frame.height - vf.height) < abs($1.frame.width - vf.width) + abs($1.frame.height - vf.height) })
+            if let fw, let frame = savedFrames[fk] {
                 placeFrame(fw.element, frame, key: fk, animated: true)
                 lastPlacedFrames[fk] = frame
                 AXUIElementPerformAction(fw.element, kAXRaiseAction as CFString)
@@ -3097,15 +3165,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return CGPoint(x: q.x, y: primary.frame.maxY - q.y)
     }
 
-    // 拖动起点是否落在我们自己的交互窗上（面板、悬停条、分隔缝、握把）；
-    // 暗色层与高亮层是穿透视觉层，不算交互窗，落在它们上面仍视为落在下方磁贴上
+    // 拖动起点是否落在我们自己的交互窗上（面板、分隔缝）；
+    // 暗色层与高亮层是穿透视觉层，不算交互窗，落在它们上面仍视为落在下方磁贴上。
+    // 悬停条与橙色握把不算阻挡：⌘ 按下已明确是拖动意图（不是点按钮），
+    // 悬停条会在拖动开始后收起；否则在标题栏区停留 0.22s 出条后，
+    // ⌘ 抓标题栏必被条挡住、交换永远触发不了。
     func pointOnOwnInteractiveWindow(_ p: CGPoint) -> Bool {
         if panelPopover.isShown,
            let w = panelPopover.contentViewController?.view.window, w.frame.contains(p) { return true }
-        if hoverPanel.isVisible, hoverPanel.frame.contains(p) { return true }
         for (_, g) in gripPanels where g.isVisible && g.frame.contains(p) { return true }
         for (_, d) in dotPanels where d.isVisible && d.frame.contains(p) { return true }
-        for (_, m) in stackMarkerPanels where m.isVisible && m.frame.contains(p) { return true }
         if let sp = stackPanel, sp.isVisible, sp.frame.contains(p) { return true }
         return false
     }
@@ -3115,7 +3184,17 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func dragMouseDown(_ event: CGEvent) -> Bool {
         guard AXIsProcessTrusted(), autoTile else { return false }
         let flags = event.flags
-        guard flags.contains(.maskCommand) else { return false }
+        // 按下时没按 ⌘也记下按下点：拖动中才按住 ⌘时，可从按下点重建拖动。
+        if !flags.contains(.maskCommand) {
+            let dp = cocoaPoint(fromQuartz: event.location) ?? event.location
+            if !pointOnOwnInteractiveWindow(dp) {
+                plainDownPoint = dp
+                plainDownScreenID = screenID(NSScreen.screens.first(where: { $0.frame.contains(dp) }) ?? NSScreen.main ?? NSScreen.screens[0])
+            } else {
+                plainDownPoint = nil; plainDownScreenID = nil
+            }
+            return false
+        }
         let p = cocoaPoint(fromQuartz: event.location) ?? event.location
         guard !pointOnOwnInteractiveWindow(p) else { return false }
         // C 批：拖动只在鼠标所在屏的磁贴上进行
@@ -3140,6 +3219,25 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // 拖动中：待定拖动移动超 3pt 才转正并开始吞事件；转正后只更新目标磁贴与目标圈
     func dragMouseDragged(_ event: CGEvent) -> Bool {
         let p = cocoaPoint(fromQuartz: event.location) ?? event.location
+        // 抓后按 ⌘：按下时没按 ⌘、拖动中才按住 ⌘，也认作交换拖动（从按下点重建）。
+        if dragState == nil, pendingDrag == nil, event.flags.contains(.maskCommand),
+           let dp = plainDownPoint, let dsid = plainDownScreenID {
+            let dx = p.x - dp.x, dy = p.y - dp.y
+            if dx * dx + dy * dy > 9,
+               let screen = NSScreen.screens.first(where: { screenID($0) == dsid }) {
+                let windows = collectWindows(on: screen)
+                let (stacks, _) = computeTiles(windows: windows, st: settingsFor(screen), sid: dsid)
+                let frames = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: screen.visibleFrame), tileCount: stacks.count, vf: screen.visibleFrame, sid: dsid)
+                if stacks.count > 1, let src = frames.firstIndex(where: { $0.contains(dp) }) {
+                    let mode: DragMode = event.flags.contains(.maskControl) ? .stack : .swap
+                    let top = stacks[src][min(stackTops[stackTopKey(dsid, src)] ?? 0, stacks[src].count - 1)]
+                    dragState = DragState(mode: mode, sourceTile: src, draggedKey: winKey(top), frames: frames, screenID: dsid)
+                    dragQuiet = true
+                    plainDownPoint = nil; plainDownScreenID = nil
+                    log("drag start mode=\(mode == .swap ? "swap" : "stack") tile=\(src) (mid-drag ⌘)")
+                }
+            }
+        }
         if dragState == nil, let pd = pendingDrag {
             let dx = p.x - pendingDragPoint.x, dy = p.y - pendingDragPoint.y
             guard dx * dx + dy * dy > 9 else { return false }
@@ -3167,6 +3265,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func dragMouseUp(_ event: CGEvent) -> Bool {
         guard let d = dragState else {
             pendingDrag = nil
+            plainDownPoint = nil; plainDownScreenID = nil
             return false
         }
         dragState = nil
@@ -3185,6 +3284,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func dragCancel() {
         dragState = nil
         pendingDrag = nil
+        plainDownPoint = nil; plainDownScreenID = nil
         dragQuiet = false
         hideDragRing()
     }
@@ -3217,12 +3317,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // 拖动交换：对调两扇窗口。堆在同一磁贴里的其余窗口留在原磁贴，改跟新来的那扇。
     func performDragSwap(from src: Int, to dst: Int, screenID sid: CGDirectDisplayID, draggedKey: String) {
-        guard AXIsProcessTrusted() else { return }
+        guard AXIsProcessTrusted() else { log("drag swap skipped: not trusted"); return }
         let screen = NSScreen.screens.first(where: { screenID($0) == sid }) ?? NSScreen.main ?? NSScreen.screens[0]
         let windows = collectWindows(on: screen)
-        guard !windows.isEmpty else { return }
+        guard !windows.isEmpty else { log("drag swap skipped: no windows"); return }
         let (stacks, _) = computeTiles(windows: windows, st: settingsFor(screen), sid: sid)
-        guard src < stacks.count, dst < stacks.count else { return }
+        guard src < stacks.count, dst < stacks.count else { log("drag swap skipped: tile out of range src=\(src) dst=\(dst) count=\(stacks.count)"); return }
         let topA: WinInfo
         if let w = windows.first(where: { winKey($0) == draggedKey }) { topA = w }
         else { topA = stacks[src][min(stackTops[stackTopKey(sid, src)] ?? 0, stacks[src].count - 1)] }
@@ -3230,7 +3330,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let keyA = winKey(topA)
         let keyB = winKey(topB)
         guard let ia = windowOrder.firstIndex(of: keyA),
-              let ib = windowOrder.firstIndex(of: keyB) else { return }
+              let ib = windowOrder.firstIndex(of: keyB) else { log("drag swap skipped: key not in windowOrder"); return }
         exchangeStackRoles(keyA, keyB)
         windowOrder.swapAt(ia, ib)
         log("drag swap tile \(src) <-> \(dst): \(topA.appName) <-> \(topB.appName)")
