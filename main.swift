@@ -566,6 +566,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var tickCount = 0
     var dragQuiet = false
     var draggingDividerID: String? = nil
+    var dividerRevertLogged = false // 同一拖动会话里“divider drag reverted”只记一次
+    // 缝拖动事件合并：mouseDragged 只记最新位置并调度一次主队列异步处理，
+    // 多个事件到达时只覆盖 pending，不排队跑重活；异步块用最新位置跑一步。
+    // 否则每事件同步跑完 100+ 次 AX（130–400ms），远跟不上 8–16ms 的事件间隔，
+    // 主线程被拖住，缝只能滞后、跳跃地跟鼠标。
+    var dividerDragPending: CGFloat? = nil
+    var dividerDragScheduled = false
+    var dividerDragCurrent: (screenID: CGDirectDisplayID, id: String, vertical: Bool)? = nil
     var hoverPanel: NSPanel!
 
     var hoverKey: String? = nil
@@ -1837,6 +1845,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if NSEvent.pressedMouseButtons == 0, draggingDividerID != nil {
             draggingDividerID = nil
             dragQuiet = false
+            dividerRevertLogged = false
             refreshGrips()
         }
         // 普通拖动弹回：没按 ⌘ 拖已平铺窗口，松手后若仍在同一屏且位置或尺寸偏离落点，
@@ -3035,6 +3044,59 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    /// 缝拖动成功落点后的虚高遗忘：只忘不学。
+    /// 条件与 logPlacementMismatch 里的遗忘一致（目标比已学值小 4pt 以上、
+    /// 实际落准即与目标差 ≤4pt），但不学新的下限——缝拖动里不写学习值。
+    /// 退化目标与瞬态尺寸同样不处理，与 logPlacementMismatch 的守卫一致。
+    func forgetInflatedMin(name: String, post: CGSize, target: CGSize) {
+        guard !name.isEmpty, var cur = learnedMinSizes[name] else { return }
+        guard target.width >= 1, target.height >= 1 else { return }
+        guard post.width >= 160, post.height >= 120 else { return }
+        var changed = false
+        if cur.width > 1, target.width + 4 < cur.width, abs(post.width - target.width) <= 4 {
+            cur.width = 0
+            changed = true
+        }
+        if cur.height > 1, target.height + 4 < cur.height, abs(post.height - target.height) <= 4 {
+            cur.height = 0
+            changed = true
+        }
+        guard changed else { return }
+        if cur.width <= 0, cur.height <= 0 {
+            learnedMinSizes.removeValue(forKey: name)
+        } else {
+            learnedMinSizes[name] = cur
+        }
+        saveLearnedMinSizes()
+        learnedMinChanged = true
+        logDiag("min-size forgotten after divider drop: \(name) \(Int(cur.width))x\(Int(cur.height))")
+    }
+
+    // 松开（phase 2）时跑一次的虚高遗忘结算：对缝两侧两格的每个成员各读一次
+    // 实际帧，按与 logPlacementMismatch 相同的条件清掉虚高下限（只忘不学）。
+    // 之所以能放在落点做，是因为缝拖动中已学值不再用来预夹——拖动中不结算，
+    // 不影响缝的活动界；落点时结算一次，下次 tile() 就不再按旧值排。
+    // AX 未 settled 时读到旧的大尺寸只会跳过遗忘，不会误清。
+    func forgetInflatedMinsForDividerDrop(screen: NSScreen, dividerID: String, vertical: Bool) {
+        let sid = screenID(screen)
+        guard let tiles = lastTilesByScreen[sid], tiles.count >= 2 else { return }
+        let frames = tiles.map { $0.frame }
+        let g = globalSettings.gap
+        let half = g / 2
+        guard let d = deriveDividers(frames: frames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else { return }
+        let mh = mainHeight()
+        for t in tiles {
+            let adjacent = vertical
+                ? abs(t.frame.maxX - (d.center - half)) < 1.5 || abs(t.frame.minX - (d.center + half)) < 1.5
+                : abs(t.frame.minY - (d.center + half)) < 1.5 || abs(t.frame.maxY - (d.center - half)) < 1.5
+            guard adjacent else { continue }
+            for w in t.stack {
+                guard let post = getFrame(w.element, screenHeight: mh) else { continue }
+                forgetInflatedMin(name: w.appName, post: post.size, target: t.frame.size)
+            }
+        }
+    }
+
     /// 把一扇窗送到 target。animated 时从当前（或飞行中）帧起跳，同一目的地不重开弹簧。
     /// 分隔线拖动传 animated: false，手跟着走。
     func containedOrRaw(_ proposed: CGRect, slot: CGRect?, minSize: CGSize) -> CGRect {
@@ -3409,26 +3471,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let g = globalSettings.gap
         let half = g / 2
         guard let d = deriveDividers(frames: oldFrames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else { return }
+        // 缝的活动界只取两项真实证据，不用已学值（stackNeed）预夹：
+        // 已学值可能陈旧（如音乐 980x0），会把缝提前顶住（hi 被定在 520，
+        // 当前缝中心正好 520，往右拖即被夹到零），且被夹住的缝永远放不进
+        // 更小的格子、也就永远没机会证伪它。demo 行为是拖到真最小尺寸才停住，
+        // 所以这里只留 deriveDividers 的几何界（160/120 绝对下限）与下面
+        // 的实际帧顶回（实时 AX 帧证据）；成员真缩不了致重叠时，落点实际复核
+        // 会把这一步撤销、缝停住；残留的超宽另有 tick 的成员级 overflow 兜底。
         var lo = d.minCenter
         var hi = d.maxCenter
-        for t in tiles {
-            let need = stackNeed(t.stack)
-            let minW = max(need.width > 1 ? need.width : 0, 160)
-            let minH = max(need.height > 1 ? need.height : 0, 120)
-            if d.vertical {
-                if abs(t.frame.maxX - (d.center - half)) < 1.5 {
-                    lo = max(lo, t.frame.minX + minW + half)
-                } else if abs(t.frame.minX - (d.center + half)) < 1.5 {
-                    hi = min(hi, t.frame.maxX - minW - half)
-                }
-            } else {
-                if abs(t.frame.minY - (d.center + half)) < 1.5 {
-                    hi = min(hi, t.frame.maxY - minH - half)
-                } else if abs(t.frame.maxY - (d.center - half)) < 1.5 {
-                    lo = max(lo, t.frame.minY + minH + half)
-                }
-            }
-        }
         // 实际帧顶回：查缝两侧两格的全部堆叠成员，不只顶部。已学尺寸为 0/未学的
         // 成员没法用 160/120 兜底——它的真实最小尺寸只有实时 AX 帧能说出来；
         // 若某成员实际帧已超出本格（被系统按真实最小尺寸顶住），就把缝顶回到实际边。
@@ -3496,12 +3547,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         var jobs: [Job] = []
         for (i, t) in tiles.enumerated() {
             let newF = newFrames[i]
+            // 帧没变的格子跳过，不重放：3 格以上布局时缝只动两侧两格，
+            // 其余格成员每事件白白各吃 2–3 次 AX。飞行中的弹簧仍要取消，
+            // 否则它会在 tick 里把窗往旧目的地拖、与缝打架。
+            for w in t.stack { frameMotions.removeValue(forKey: winKey(w)) }
+            guard abs(newF.width - oldFrames[i].width) > 0.5 || abs(newF.height - oldFrames[i].height) > 0.5
+                || abs(newF.minX - oldFrames[i].minX) > 0.5 || abs(newF.minY - oldFrames[i].minY) > 0.5 else {
+                tiles[i].frame = newF
+                continue
+            }
             for w in t.stack {
                 let key = winKey(w)
                 let old = lastPlacedFrames[key] ?? t.frame
                 let shrinking = newF.width <= old.width + 0.5 && newF.height <= old.height + 0.5
                 jobs.append(Job(el: w.element, old: old, new: newF, key: key, shrinking: shrinking))
-                frameMotions.removeValue(forKey: key)
             }
             tiles[i].frame = newF
         }
@@ -3574,10 +3633,17 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
             raiseGrips()
-            log("divider drag reverted: actual overlap after drop, seam stays")
+            // 同一拖动会话里只记一次：顶住真最小尺寸持续拖动时，每步都会撤销，日志会刷屏。
+            if !dividerRevertLogged {
+                log("divider drag reverted: actual overlap after drop, seam stays")
+                dividerRevertLogged = true
+            }
             return
         }
         for j in jobs { lastPlacedFrames[j.key] = j.new }
+        // 虚高遗忘不在每步做：每步给变格成员各读一次帧是纯浪费（约 32 次 AX），
+        // 且缝拖动中已学值本来就不再用来预夹。改到松开（phase 2）时跑一次，
+        // 用落点时的一次读帧结算全部成员，只忘不学的规则不变。
         lastTilesByScreen[sid] = tiles
         if screenID(activeScreen()) == sid { lastTiles = tiles }
         let frac = vertical
@@ -3633,13 +3699,51 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         switch phase {
                         case 0:
                             self.draggingDividerID = dd.id
+                            self.dividerDragCurrent = (screenID: dd.screenID, id: dd.id, vertical: dd.vertical)
+                            self.dividerDragPending = nil
+                            self.dividerDragScheduled = false
                             self.dragQuiet = true
+                            self.dividerRevertLogged = false
                         case 1:
-                            guard let scr = NSScreen.screens.first(where: { self.screenID($0) == dd.screenID }) else { return }
-                            self.applyDividerDrag(screen: scr, dividerID: dd.id, vertical: dd.vertical, proposed: value)
+                            // 事件合并：只记最新位置，不直接跑 applyDividerDrag。
+                            // 主队列异步块用最新位置跑一步；多个事件到达时只覆盖
+                            // pending，不排队。位置是绝对坐标（非增量），
+                            // 所以丢弃中间值不丢行程，缝跟的是当前鼠标位置。
+                            self.dividerDragPending = value
+                            if !self.dividerDragScheduled {
+                                self.dividerDragScheduled = true
+                                DispatchQueue.main.async { [weak self] in
+                                    guard let self = self else { return }
+                                    self.dividerDragScheduled = false
+                                    guard let pending = self.dividerDragPending else { return }
+                                    self.dividerDragPending = nil
+                                    guard let cur = self.dividerDragCurrent,
+                                          let scr = NSScreen.screens.first(where: { self.screenID($0) == cur.screenID }) else { return }
+                                    self.applyDividerDrag(screen: scr, dividerID: cur.id, vertical: cur.vertical, proposed: pending)
+                                }
+                            }
                         default:
+                            // 松开：先同步刷掉未处理的 pending 位置，保证落点不丢
+                            // 最后一段；已入队的异步块届时见 pending 为 nil 即空转。
+                            // 顺序不能反：applyDividerDrag 期间 draggingDividerID
+                            // 必须仍非空（tick 弹回与 refreshGrips 都以此为界），
+                            // 且虚高遗忘要在最终帧上结算。
+                            if let pending = self.dividerDragPending {
+                                self.dividerDragPending = nil
+                                self.dividerDragScheduled = false
+                                if let cur = self.dividerDragCurrent,
+                                   let scr = NSScreen.screens.first(where: { self.screenID($0) == cur.screenID }) {
+                                    self.applyDividerDrag(screen: scr, dividerID: cur.id, vertical: cur.vertical, proposed: pending)
+                                }
+                            }
+                            if let cur = self.dividerDragCurrent,
+                               let scr = NSScreen.screens.first(where: { self.screenID($0) == cur.screenID }) {
+                                self.forgetInflatedMinsForDividerDrop(screen: scr, dividerID: cur.id, vertical: cur.vertical)
+                            }
+                            self.dividerDragCurrent = nil
                             self.draggingDividerID = nil
                             self.dragQuiet = false
+                            self.dividerRevertLogged = false
                             self.refreshGrips()
                             log("split dragged: \(dd.id)")
                             self.refreshPanel()
