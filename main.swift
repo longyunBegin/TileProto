@@ -2,29 +2,17 @@ import AppKit
 import ApplicationServices
 import QuartzCore
 
-// TileProto: 自动平铺原型 v5（面板版）
-// v5：纯文字 NSMenu 换成菜单栏面板（NSPopover），平铺引擎不动。
-// 菜单栏常驻；监听窗口集合变化（打开/关闭/最小化），自动按布局平铺主屏窗口。
-// 原理：Accessibility API（AXUIElement）枚举窗口 + 改位置大小。
-// 行为模型（全部自行实现）：
-//  1. 单一自适应布局：1 全屏、2 左右分、3 三列等分、4 2×2；gap 固定 8。
-//     格子数 = min(窗口数, 格子数上限, 4)；1 格 = 真全屏（不留边）。
-//  2. 堆叠：窗口数超过磁贴数时，多余窗口堆进活动磁贴；⌃⌘ 拖到某磁贴上时，
-//     即使刚好满格，被拖窗口也并进该磁贴，原格子收掉并重排。同磁贴共享 frame。
-//     橙色标记点按轮换栈顶，悬停上沿用芯片直达并激活。
-//  3. 主窗口尺寸 Half/60%/Two-thirds，作用于 Grid（3 磁贴）与 Side 的主窗口宽度。
-//  4. 间距 4/8/16 pt，作用于窗口间与屏幕边缘。
-//  5. Focus 模式：活动窗口以短弹簧放大到 visibleFrame，其余窗口留在原位被盖住；
-//     再按一次从记录的 frame 精确缩回（含手动分隔比例）。
-//     Clean Space：其余窗口滑出屏外，活动窗口弹簧到屏幕中央，桌面铺深色，Dock 仍在。
-// v3 保留：防抖（变化稳定 2 周期才重排）、对话框类排除、按应用排除、
-// 自动平铺开关、立即平铺、授权指示（▦!）与重新请求权限、退出。
-// v6 新增（面板版之上，不动面板结构与平铺引擎主干）：
-//  悬停快捷条（窗口上沿 Primary / Focus / Float，轮询鼠标位置，无需新权限）；
-//  可拖分隔线（共享边上的自有小手柄，拖动改分割比例并记忆，面板可重置）；
-//  单窗口 Float（pid+标题跟踪）与恢复全部浮动窗口。
-// 高亮：默认关（对齐 Shoji）。菜单 Borders 在无边框和活动窗口边框之间切换；
-// 暗色：非活动窗口 0.5 遮罩，淡入淡出（No peek）。布局移动走约 0.5s 的短弹簧。
+// TileProto：菜单栏自动平铺。操作只在鼠标和菜单栏面板上。
+// 原理：Accessibility API（AXUIElement）枚举窗口并改 frame。
+//  1. 单一自适应布局：1 全屏、2 左右分、3 三列等分、4 田字。间距固定 8。
+//     格子数 = min(窗口数, 上限, 4)。一格铺满工作区，不留边。
+//  2. 窗口多于格子时堆进活动格子。橙色握把点按轮换；悬停上沿用芯片直达。
+//     ⌃⌘ 拖到某格子上时，即使刚好满格也并进去，空出的格子收掉。
+//  3. ⌘ 拖到另一格子交换。普通拖动松手弹回，并提示要按住 ⌘。
+//  4. Primary：被点窗口与第 0 格顶部互换。Focus：铺满工作区，再点悬停条上的 Focus，
+//     按进入前记下的帧还原。Float：按当前尺寸居中，其余窗口立刻补位。
+//  5. 活动格子描边，其余格子盖 50% 暗色。两者固定开启，没有单独开关。
+// 布局、交换、Focus、弹回约 0.5 秒短弹簧。拖分隔线跟手。
 
 func log(_ msg: String) {
     let line = "[\(Date())] \(msg)\n"
@@ -239,7 +227,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var lastPanelHeight: CGFloat = 0
     // v6 状态：悬停条 / 分隔线 / Float / Primary / 自定义分割
     var floatedKeys: Set<String> = []          // 单窗口 Float：pid|标题
-    // Shoji 式最小尺寸学习：key = 应用名（learnName 已在两条落点路径上传入），
+    // 最小尺寸学习：key = 应用名（learnName 已在两条落点路径上传入），
     // 值 = 观测到的落点下限（每维独立）；存 UserDefaults 持久化本机。
     var learnedMinSizes: [String: CGSize] = [:]
     var learnedMinChanged = false
@@ -267,19 +255,18 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var stackPanelTile = 0
     var restoreFloatsButton: NSButton!
     var loginSwitch: NSSwitch!
-    // v7 状态：全局快捷键与 Tab View
-    var shortcutsEnabled = true
+    // 鼠标重排：会话事件 tap 只订阅左键，用来识别 ⌘ 交换和 ⌃⌘ 进堆叠。
     var eventTap: CFMachPort?
     var tapSource: CFRunLoopSource?
     var tapRunning = false
+    var mouseTapFailedLogged = false
     var windowOrder: [String] = []
     /// 手动堆叠：key 不占自己的磁贴，跟在 host 窗口所在的磁贴里。
     /// 窗口数刚好等于上限时，⌃⌘ 拖上去也靠这张表并进目标磁贴，原格子收掉。
     var stackedOnto: [String: String] = [:]
 
-    // v8 状态：No peek / Clean Space（悬停激活已固定关、Dim 固定 0.5、Blur 固定关、背景固定 graphite）
+    // 活动格子描边、其余格子 50% 暗色，都固定开启。
     var lastActiveTile = 0
-    // 高亮：默认 None（与 Shoji 设置页一致）。菜单 Borders 在 None 与活动边框之间切换。
 
     // D 批状态：⌘拖交换 / ⌃⌘拖进堆叠
     enum DragMode { case swap, stack }
@@ -298,9 +285,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var pinnedActiveTile: Int? = nil
     var pinnedFrontmostPid: pid_t? = nil
 
-    // B 批第二部分：Activity 统计（UserDefaults，bundle ID 不变则换二进制不丢数；
-    // 只记数字与快捷键名，绝不记窗口标题与应用名）
-    var lastPlacedFrames: [String: CGRect] = [:]  // 上次平铺落点：winKey -> frame
+    // 上次平铺落点：普通拖动弹回、Focus 还原都读它。只活在这次运行里。
+    var lastPlacedFrames: [String: CGRect] = [:]  // winKey -> frame
     // C 批：多显示器 + Spaces（每屏独立设置、窗口集合与磁贴 frame；单屏时与旧行为一致）
     struct ScreenSettings {
         var tileLimit = 4
@@ -419,7 +405,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         loadLearnedMinSizes()
         setupPanelUI()
         setupHoverBar()
-        setupHotkeys()
+        setupMouseDragTap()
         requestAccessibility()
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
@@ -427,7 +413,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             self?.updateHover()
         }
-        // C 批：切 Space 与接/断屏时立即重排（不等 1 秒轮询）；Focus/Clean Space 下 forceTile 会跳过
+        // 切 Space 与接/断屏时立即重排。Focus 期间 forceTile 会跳过。
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             log("space changed")
             self?.forceTile()
@@ -454,14 +440,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panelPopover.contentViewController = vc
         panelPopover.behavior = .transient
         panelPopover.animates = true
-        // 面板获得焦点时按 Escape 关闭（兜底；transient 本身也会处理失焦关闭）
-        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.keyCode == 53, self?.panelPopover.isShown == true {
-                self?.panelPopover.close()
-                return nil
-            }
-            return event
-        }
         refreshPanel()
     }
 
@@ -926,6 +904,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             statusItem.button?.title = trusted ? "▦" : "▦!"
             log(trusted ? "Accessibility trusted: true"
                 : "NOT TRUSTED: tiling disabled, re-grant in System Settings > Privacy & Security > Accessibility")
+            if trusted {
+                mouseTapFailedLogged = false
+                setupMouseDragTap()
+            }
         }
         guard trusted else {
             hideGrips()
@@ -947,8 +929,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             closeStackPanel()
             return
         }
-        // D 批：pin 住的目标磁贴在用户切到别的 App 时放开，并重排一次；
-        // Focus / Clean Space 期间只清 pin、不重排（退出后正常流程会重排）
+        // pin 住的目标磁贴在用户切到别的 App 时放开，并重排一次。
+        // 专注屏上 tile() 保持铺满，不把那扇窗口拉回格子。
         if pinnedActiveTile != nil, let pp = pinnedFrontmostPid,
            NSWorkspace.shared.frontmostApplication?.processIdentifier != pp {
             pinnedActiveTile = nil
@@ -1222,13 +1204,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 布局几何
 
-    /// 这块屏在该布局下能放下几块磁贴。
-    /// 阈值按可见区域的点算（菜单栏和 Dock 已经不在 visibleFrame 里），
-    /// 对齐 Shoji 文案：MacBook 级屏幕 Columns 3、Rows 2、Side 3、Grid 4；
-    /// 更宽（≥1800pt，16 寸默认约 1728 仍算 MacBook）Columns 到 4；
-    /// 更高（≥1100pt）Rows 到 3；宽和高都过线 Side 才到 4。
-    /// 竖屏（高大于宽）一律按行堆：Columns 降到 2，Rows 升到 3。
-    // 单一自适应布局（gap 固定 8）：1 全屏、2 左右分、3 三列等分、4 2×2
+    // 单一自适应布局（间距固定 8）：1 全屏、2 左右分、3 三列等分、4 田字。
     func tileFrames(count t: Int, vf: CGRect) -> [CGRect] {
         let g: CGFloat = 8
         switch min(t, 4) {
@@ -1260,7 +1236,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // 把窗口分到各磁贴：前 t 个窗口每磁贴一个，多余的堆进活动磁贴。
     // 活动磁贴 = 最前窗口所在的磁贴；最前窗口不在磁贴内（或没有）时为第 0 个。
-    // v7：窗口顺序（快捷键交换用）：先按 windowOrder 排，再把 Primary 移到首位；
+    // 窗口顺序（⌘ 交换会改这张表）：先按 windowOrder 排，再把 Primary 移到首位；
     // 新窗口追加到末尾（未满时自成一格，满时进活动磁贴堆叠），消失的窗口剔除。
     // C 批：只追加新窗口，不裁剪——按屏调用 computeTiles 时不能误删别屏的顺序；
     // 消失窗口的裁剪由 tileAll 按全屏集合统一做
@@ -1588,14 +1564,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
-        // Shoji 式分割线让位：格子顶部窗口的学习最小尺寸大于格子时，移动相邻
+        // 分割线让位：格子顶部窗口的学习最小尺寸大于格子时，移动相邻
         // 分隔线把格子扩到该下限，从邻格匀空间；邻格不被压到自己的学习下限
         // 以下，也不小于 160 宽/120 高、不侵占 8pt 缝。拖分隔线时跳过。
         if draggingDividerID == nil {
             frames = applyGiveWay(frames: frames, stacks: fitStacks, sid: sid)
         }
-        // Shoji 式装不下就居中浮动：让位后格子顶部窗口的学习最小尺寸仍大于格子，
-        // 该窗口移到屏幕中央、按自然尺寸浮动，并进 floatedKeys（与手动 ⌃⌥F 同一套机制，
+        // 装不下就居中浮动：让位后格子顶部窗口的学习最小尺寸仍大于格子，
+        // 该窗口移到屏幕中央、按自然尺寸浮动，并进 floatedKeys（与悬停条 Float 同一套机制，
         // 面板“恢复浮动窗口”可恢复；下一轮 tick 收集窗口时它被跳过，格子随即重排干净）。
         // 恢复后若再次装不下会再次浮动，这是符合规则的行为，不另加状态。
         var floatedCenters: [String: CGRect] = [:]
@@ -2154,7 +2130,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         gripPanels.removeAll()
     }
 
-    // MARK: - demo 补齐：Toast pill（底部中央，3 秒自动消失）
+    // MARK: - 提示条（约 2.5 秒后消失）
 
     var toastPanel: NSPanel?
     var toastWork: DispatchWorkItem?
@@ -2246,10 +2222,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         toastPanel?.orderOut(nil)
     }
 
-    // MARK: - demo 补齐：活动磁贴顶部蓝圆点手柄 + 堆叠标记 + 堆叠浮层
+    // MARK: - 堆叠握把（活动格子不画常驻圆点，操作从窗口上沿悬停条进入）
 
     func refreshDotHandles() {
-        // Shoji 没有常驻蓝点。快捷条由窗口上沿的停留区触发。
         hideDotHandles()
     }
 
@@ -2452,12 +2427,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         forceTile()
     }
 
-    // MARK: - 悬停切换条（格子上沿停留 0.22s 出现）
-    // 旧实现取自 origin/main（3de92674）setupHoverBar/showHoverBar/updateHover，
-    // 已删：Primary/Focus/Float 的旧版快捷键徽标（本版按钮只有文字，不新增热键绑定）、
-    // Hover focus 悬停激活（0.4s 抬窗）、hoverBarOn 开关、panelPopover 守卫。
-    // 橙色堆叠标记保留不动；悬停条是直接挑窗口的入口，两者共存（条放标记上方 4pt，
-    // 顶行格子放不下时改放格子内、标记下方 4pt，不盖标记）。
+    // MARK: - 悬停条（格子上沿停留约 0.22 秒出现）
+    // Primary / Focus / Float 只有文字。
+    // 橙色堆叠标记保留。悬停条是直接挑窗口的入口，两者共存：条放在标记上方；
+    // 顶行格子放不下时改放格子内、标记下方，不盖住标记。
 
     var hoverBarView: NSView!
     var hoverSid: CGDirectDisplayID = 0
@@ -2522,7 +2495,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             row.addArrangedSubview(hoverChip("›", tag: 1, action: #selector(hoverStackStep(_:)), emphasized: false))
         }
-        // 三个按钮只有文字，没有快捷键徽标，也不新增任何热键绑定。
+        // 三个按钮只有文字。
         // Primary：已是 tile0 顶部时 disabled（tileIndex == 0 即被点窗口就是 tile0 顶部）。
         row.addArrangedSubview(hoverChip("Primary", tag: 0, action: #selector(hoverPrimary(_:)), emphasized: false, enabled: tileIndex != 0))
         row.addArrangedSubview(hoverChip("Focus", tag: 0, action: #selector(hoverFocus(_:)), emphasized: false))
@@ -2631,7 +2604,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func hoverTileBack(_ sender: NSButton) {
-        // 悬浮窗口重新进入平铺：重算（与 demo 一致，不是精确恢复）。
+        // 悬浮窗口重新进入平铺：按当前布局重算，不是精确恢复。
         guard let w = resolveHoverTarget() else { return }
         let key = winKey(w)
         guard floatedKeys.contains(key) else { return }
@@ -2642,8 +2615,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("hover tile back -> \(w.appName)")
     }
 
-    // 专注模式最小悬停条：仅含 Focus（用于退出；无快捷键约束下的必要偏离，
-    // demo 里专注模式无悬停栏，但 TileProto 没有 ⌃⌥Z，必须给按钮退出路）。
+    // 专注模式最小悬停条：只放一个 Focus，用来退出。
     // 专注窗口铺满可视区、上方无缝隙，条放上沿内侧。
     func showFocusHoverBar(screen: NSScreen, focusKey fk: String) {
         guard hoverPanel != nil else { return }
@@ -2847,7 +2819,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func hoverFloat(_ sender: NSButton) {
-        // 手动 Float 开关，与 ⌃⌥F 同一套 floatedKeys 机制；按钮只触发它。
+        // 手动 Float：写入 floatedKeys。悬停条上的按钮只走这一条。
         guard let w = resolveHoverTarget() else { return }
         let key = winKey(w)
         if floatedKeys.contains(key) {
@@ -2966,8 +2938,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Focus 模式
     // 盖住式最小行为：聚焦窗口铺满所在屏可视区盖住其他窗口，其余窗口不动；
     // 再点一次 Focus 按钮或 Retile 即退出并 forceTile 恢复平铺。
-    // 不复活 Clean Space，不存恢复帧（其他窗口本来就没动过），不弹提示条，
-    // 不新增热键绑定（旧 ⌃⌥Z 不恢复）。
+    // 其余窗口留在原处。退出时按进入前的快照还原；窗口集合变了就先还原还在的，再重排。
 
     var focusKey: String? = nil
     var focusScreen: CGDirectDisplayID? = nil
@@ -3066,7 +3037,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 
 
-    // MARK: - v8 悬停激活 / No peek / Clean Space
+    // MARK: - 悬停条状态
 
 
 
@@ -3083,20 +3054,27 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 
 
-    // MARK: - v7 全局快捷键（CGEventTap，只监听、不拦截）
+    // MARK: - 鼠标重排（会话事件 tap，只订阅鼠标）
 
-    func setupHotkeys() {
-        guard shortcutsEnabled, !tapRunning else { return }
-        // D 批：同一 tap 再接鼠标按下/拖动/松开，用于 ⌘拖交换与 ⌃⌘拖进堆叠；
-        // 非拖动模式的鼠标事件一律原样放行
-        let mask = CGEventMask(1 << CGEventType.keyDown.rawValue)
-            | CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+    /// 创建过滤型事件 tap，识别按住 ⌘ / ⌃⌘ 的窗口拖动。
+    /// 掩码只有左键按下、拖动、松开。
+    /// 创建失败只记一次。辅助功能稍后变为已允许时，tick 会再试。
+    func setupMouseDragTap() {
+        guard !tapRunning else { return }
+        let mask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
             | CGEventMask(1 << CGEventType.leftMouseDragged.rawValue)
             | CGEventMask(1 << CGEventType.leftMouseUp.rawValue)
-        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
-                                          eventsOfInterest: mask, callback: hotkeyTapCallback, userInfo: nil) else {
+        guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap,
+                                          place: .headInsertEventTap,
+                                          options: .defaultTap,
+                                          eventsOfInterest: mask,
+                                          callback: mouseDragTapCallback,
+                                          userInfo: nil) else {
             tapRunning = false
-            log("hotkeys: event tap unavailable (needs Input Monitoring in System Settings)")
+            if !mouseTapFailedLogged {
+                mouseTapFailedLogged = true
+                log("mouse drag tap unavailable; command-drag swap stays off until the session event tap can be created")
+            }
             return
         }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
@@ -3105,134 +3083,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         eventTap = tap
         tapSource = src
         tapRunning = true
-        log("hotkeys: event tap running")
-    }
-
-    // 快捷键分发（keyCode 为 US 布局值）：只留 ⌃⌥方向键（方向交换）与 ⌃⌥F（Float 切换），其余一律放行
-    func handleHotkey(keyCode: UInt16, flags: CGEventFlags) {
-        let ctrl = flags.contains(.maskControl)
-        let opt = flags.contains(.maskAlternate)
-        guard ctrl, opt, !flags.contains(.maskCommand), !flags.contains(.maskShift) else { return }
-        switch keyCode {
-        case 123: swapTile(dx: -1, dy: 0)
-        case 124: swapTile(dx: 1, dy: 0)
-        case 125: swapTile(dx: 0, dy: -1)
-        case 126: swapTile(dx: 0, dy: 1)
-        case 3: toggleFloatFront()
-        default: break
-        }
-    }
-
-    // 活动窗口与相邻方向磁贴交换（整格对调，堆叠跟随栈顶窗口走）；
-    // C 批：该方向上已是屏边缘且该方向上有另一块屏时，改为把窗口送到那块屏
-    func swapTile(dx: Int, dy: Int) {
-        guard AXIsProcessTrusted() else { log("swap skipped: not trusted"); return }
-
-        let screen = activeScreen()
-        let sid = screenID(screen)
-        let st = settingsFor(screen)
-        let windows = collectWindows(on: screen)
-        guard !windows.isEmpty else { return }
-        let (stacks, active) = computeTiles(windows: windows, st: st, sid: sid)
-        guard stacks.count > 1 else {
-            moveActiveWindowAcrossScreen(from: screen, dx: dx, dy: dy)
-            return
-        }
-        let vf = screen.visibleFrame
-        let frames = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: vf), tileCount: stacks.count, vf: vf, sid: sid)
-        let a = frames[active]
-        var best: Int? = nil
-        var bestKey: CGFloat = 0
-        for i in frames.indices where i != active {
-            let f = frames[i]
-            if dx == -1 {
-                guard f.maxX <= a.minX + 1.5, min(a.maxY, f.maxY) - max(a.minY, f.minY) > 20 else { continue }
-                if best == nil || f.maxX > bestKey { best = i; bestKey = f.maxX }
-            } else if dx == 1 {
-                guard f.minX >= a.maxX - 1.5, min(a.maxY, f.maxY) - max(a.minY, f.minY) > 20 else { continue }
-                if best == nil || f.minX < bestKey { best = i; bestKey = f.minX }
-            } else if dy == 1 {
-                guard f.minY >= a.maxY - 1.5, min(a.maxX, f.maxX) - max(a.minX, f.minX) > 20 else { continue }
-                if best == nil || f.minY < bestKey { best = i; bestKey = f.minY }
-            } else if dy == -1 {
-                guard f.maxY <= a.minY + 1.5, min(a.maxX, f.maxX) - max(a.minX, f.minX) > 20 else { continue }
-                if best == nil || f.maxY > bestKey { best = i; bestKey = f.maxY }
-            }
-        }
-        guard let nb = best else {
-            moveActiveWindowAcrossScreen(from: screen, dx: dx, dy: dy)
-            return
-        }
-        let topA = stacks[active][min(stackTops[stackTopKey(sid, active)] ?? 0, stacks[active].count - 1)]
-        let topB = stacks[nb][min(stackTops[stackTopKey(sid, nb)] ?? 0, stacks[nb].count - 1)]
-        let keyA = winKey(topA)
-        let keyB = winKey(topB)
-        guard let ia = windowOrder.firstIndex(of: keyA),
-              let ib = windowOrder.firstIndex(of: keyB) else { return }
-        exchangeStackRoles(keyA, keyB)
-        windowOrder.swapAt(ia, ib)
-        log("swap tile \(active) <-> \(nb): \(topA.appName) <-> \(topB.appName)")
-        forceTile()
-        refreshPanel()
-    }
-
-    // C 批：按几何方向找相邻屏（dy 以 Cocoa 系为准：1 为向上、-1 为向下）
-    func adjacentScreen(from screen: NSScreen, dx: Int, dy: Int) -> NSScreen? {
-        let f = screen.frame
-        var best: NSScreen? = nil
-        var bestKey: CGFloat = 0
-        for s in NSScreen.screens where screenID(s) != screenID(screen) {
-            let g = s.frame
-            if dx == 1 {
-                guard g.minX >= f.maxX - 1.5, min(f.maxY, g.maxY) - max(f.minY, g.minY) > 20 else { continue }
-                if best == nil || g.minX < bestKey { best = s; bestKey = g.minX }
-            } else if dx == -1 {
-                guard g.maxX <= f.minX + 1.5, min(f.maxY, g.maxY) - max(f.minY, g.minY) > 20 else { continue }
-                if best == nil || g.maxX > bestKey { best = s; bestKey = g.maxX }
-            } else if dy == 1 {
-                guard g.minY >= f.maxY - 1.5, min(f.maxX, g.maxX) - max(f.minX, g.minX) > 20 else { continue }
-                if best == nil || g.minY < bestKey { best = s; bestKey = g.minY }
-            } else if dy == -1 {
-                guard g.maxY <= f.minY + 1.5, min(f.maxX, g.maxX) - max(f.minX, g.minX) > 20 else { continue }
-                if best == nil || g.maxY > bestKey { best = s; bestKey = g.maxY }
-            }
-        }
-        return best
-    }
-
-    // C 批：把活动屏的前台窗口送到相邻屏——先挪到目标屏中央附近（保持尺寸），
-    // 再 forceTile：下次按屏归属采集时它已在目标屏，按目标屏设置入队平铺
-    func moveActiveWindowAcrossScreen(from screen: NSScreen, dx: Int, dy: Int) {
-        guard let target = adjacentScreen(from: screen, dx: dx, dy: dy) else {
-            log("swap skipped: no tile or screen in that direction")
-            return
-        }
-        let windows = collectWindows(on: screen)
-        guard let fi = frontmostIndex(windows: windows) else { return }
-        let w = windows[fi]
-        let tvf = target.visibleFrame
-        let nw = w.frame.width >= 10 ? min(w.frame.width, tvf.width - 16) : tvf.width * 0.5
-        let nh = w.frame.height >= 10 ? min(w.frame.height, tvf.height - 16) : tvf.height * 0.5
-        let nx = tvf.midX - nw / 2
-        let ny = tvf.midY - nh / 2
-        setSize(w.element, CGSize(width: nw, height: nh))
-        setPosition(w.element, CGPoint(x: nx, y: mainHeight() - (ny + nh)))
-        windowOrder.removeAll { $0 == winKey(w) }
-        windowOrder.append(winKey(w))
-        log("move window across screen -> \(screenName(target)): \(w.appName)")
-        forceTile()
-        refreshPanel()
+        mouseTapFailedLogged = false
+        log("mouse drag tap running")
     }
 
     // MARK: - D 批 ⌘拖交换 / ⌃⌘拖进堆叠
 
-    // CGEvent 坐标是 Quartz 系（左上原点、y 向下），转成 Cocoa 系（左下原点、y 向上）
+    // CGEvent 是 Quartz 全局坐标：原点在主显示器（screens[0]，菜单栏所在屏）左上角，y 向下。
+    // Cocoa 全局坐标 y 向上，主屏顶边是 screens[0].frame.maxY。
+    // 不用 NSScreen.main：那是关键窗口所在屏，副屏上会把命中点算偏。
     func cocoaPoint(fromQuartz q: CGPoint) -> CGPoint? {
-        guard let screen = NSScreen.main else { return nil }
-        return CGPoint(x: q.x, y: screen.frame.height - q.y)
+        guard let primary = NSScreen.screens.first else { return nil }
+        return CGPoint(x: q.x, y: primary.frame.maxY - q.y)
     }
 
-    // 拖动起点是否落在我们自己的交互窗上（面板、悬停条、手柄、Tab View、设置窗）；
+    // 拖动起点是否落在我们自己的交互窗上（面板、悬停条、分隔缝、握把）；
     // 暗色层与高亮层是穿透视觉层，不算交互窗，落在它们上面仍视为落在下方磁贴上
     func pointOnOwnInteractiveWindow(_ p: CGPoint) -> Bool {
         if panelPopover.isShown,
@@ -3263,7 +3128,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vf = screen.visibleFrame
         let frames = applySplitOverrides(frames: tileFrames(count: stacks.count, vf: vf), tileCount: stacks.count, vf: vf, sid: sid)
         guard let src = frames.firstIndex(where: { $0.contains(p) }) else { return false }
-        // ⌘ 交换；⌃⌘ 加入堆叠。⌥⌘ 不再当堆叠（与 Shoji 的 Control-Command 一致）。
+        // ⌘ 交换；再按住 ⌃ 则加入堆叠。只认 control 与 command。
         let mode: DragMode = flags.contains(.maskControl) ? .stack : .swap
         // 当前栈顶（不用 stacks[].first，也不依赖可能滞后的 lastTilesByScreen）
         let top = stacks[src][min(stackTops[stackTopKey(sid, src)] ?? 0, stacks[src].count - 1)]
@@ -3425,33 +3290,18 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshPanel()
     }
 
-    func toggleFloatFront() {
-        guard AXIsProcessTrusted() else { return }
-        let windows = collectWindows(on: activeScreen())
-        guard let fi = frontmostIndex(windows: windows) else { return }
-        let w = windows[fi]
-        let key = winKey(w)
-        if floatedKeys.contains(key) {
-            floatedKeys.remove(key)
-            log("hotkey: float off -> \(w.appName) back to tiling")
-            forceTile()
-            refreshPanel()
-        } else {
-            floatWindow(w, source: "hotkey")
-        }
-    }
-
 }
 
-// v7：事件 tap 回调（C 函数指针，只监听、不拦截；匹配到的组合执行动作后原样放行）
-func hotkeyTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
-    if type == .tapDisabledByTimeout {
+
+// 鼠标重排的事件 tap。只处理左键；手势确认之后才吞掉拖动和松开，其余原样放行。
+// 系统停掉 tap 时重新打开，并取消进行中的手势。
+func mouseDragTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent, refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
         delegate.dragCancel()
         if let tap = delegate.eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
         return Unmanaged.passUnretained(event)
     }
-    guard delegate.shortcutsEnabled, delegate.tapRunning else { return Unmanaged.passUnretained(event) }
-    // D 批拖动：只有拖动模式中的鼠标事件才吞掉，其余一律放行
+    guard delegate.tapRunning else { return Unmanaged.passUnretained(event) }
     switch type {
     case .leftMouseDown:
         if delegate.dragMouseDown(event) { return nil }
@@ -3462,23 +3312,9 @@ func hotkeyTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: CGEvent
     case .leftMouseUp:
         if delegate.dragMouseUp(event) { return nil }
         return Unmanaged.passUnretained(event)
-    default: break
+    default:
+        return Unmanaged.passUnretained(event)
     }
-    guard type == .keyDown else { return Unmanaged.passUnretained(event) }
-    // 堆叠浮层打开时按 Escape：关闭浮层并吞掉按键
-    if delegate.stackPanel?.isVisible == true, UInt16(event.getIntegerValueField(.keyboardEventKeycode)) == 53 {
-        delegate.closeStackPanel()
-        return nil
-    }
-    // 拖动中按 Escape：取消拖动（含待定拖动）并吞掉按键
-    if delegate.dragState != nil || delegate.pendingDrag != nil, UInt16(event.getIntegerValueField(.keyboardEventKeycode)) == 53 {
-        delegate.dragCancel()
-        return nil
-    }
-    let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-    let flags = event.flags
-    delegate.handleHotkey(keyCode: keyCode, flags: flags)
-    return Unmanaged.passUnretained(event)
 }
 
 let delegate = TileProtoApp()
