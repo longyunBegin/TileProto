@@ -6275,8 +6275,8 @@ private func runTileProtoSelfTest() {
     tileProtoCheck(effectiveTileLimit(4, kind: .rows, vf: mac, gap: macGap) == 2, "rows limit clamps to 2")
     tileProtoCheck(effectiveTileLimit(4, kind: .side, vf: mac, gap: macGap) == 3, "side limit clamps to 3")
 
-    let wide = CGRect(x: 0, y: 0, width: 1728, height: 1015)
-    tileProtoCheck(layoutCountFits(4, kind: .columns, vf: wide, gap: macGap), "wider screen unlocks four columns")
+    let wideScreen = CGRect(x: 0, y: 0, width: 1728, height: 1015)
+    tileProtoCheck(layoutCountFits(4, kind: .columns, vf: wideScreen, gap: macGap), "wider screen unlocks four columns")
     let tall = CGRect(x: 0, y: 0, width: 1440, height: 1200)
     tileProtoCheck(layoutCountFits(3, kind: .rows, vf: tall, gap: macGap), "taller screen unlocks three rows")
     tileProtoCheck(layoutCountFits(4, kind: .side, vf: tall, gap: macGap), "taller screen unlocks side 4")
