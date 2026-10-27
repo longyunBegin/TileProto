@@ -622,7 +622,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// spring：日常重排，约 5% 过冲。settle：交换/抬起，精确落到终点，不过冲、不互相穿透。
     enum MotionEase { case spring, settle }
     struct DragState {
-        let mode: DragMode
+        var mode: DragMode  // 拖动中可随 ⌥ 在 swap↔stack 间切换
         let sourceTile: Int
         let draggedKey: String
         let frames: [CGRect]  // mouseDown 时的磁贴 frame（Cocoa 坐标）
