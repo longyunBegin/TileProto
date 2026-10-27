@@ -191,7 +191,7 @@ func spanShare(count: Int, share: CGFloat) -> CGFloat {
 func columnFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
     guard n > 1 else { return [vf] }
     let inner = vf.width - g * CGFloat(n + 1)
-    guard inner > n else { return Array(repeating: vf, count: n) }
+    guard inner > CGFloat(n) else { return Array(repeating: vf, count: n) }
     let fraction = spanShare(count: n, share: share)
     let floor = min(120, inner / CGFloat(n))
     var primary = inner * fraction
@@ -213,7 +213,7 @@ func columnFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [
 func rowFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
     guard n > 1 else { return [vf] }
     let inner = vf.height - g * CGFloat(n + 1)
-    guard inner > n else { return Array(repeating: vf, count: n) }
+    guard inner > CGFloat(n) else { return Array(repeating: vf, count: n) }
     let fraction = spanShare(count: n, share: share)
     let floor = min(80, inner / CGFloat(n))
     var primary = inner * fraction
@@ -1535,7 +1535,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func loadExcluded() {
-        let text = (try? String(contentsOfFile: excludedFilePath())) ?? ""
+        let text = (try? String(contentsOf: URL(fileURLWithPath: excludedFilePath()), encoding: .utf8)) ?? ""
         excludedBundles = Set(text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") })
     }
 
@@ -1611,10 +1611,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func setAppExcluded(_ bid: String, _ excluded: Bool) {
         let path = excludedFilePath()
-        var set = Set((try? String(contentsOfFile: path))?.split(separator: "\n").map(String.init) ?? [])
+        var set = Set((try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8))?.split(separator: "\n").map(String.init) ?? [])
         if excluded { set.insert(bid) } else { set.remove(bid) }
         let text = set.sorted().joined(separator: "\n")
-        try? (text.isEmpty ? "" : text + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        try? (text.isEmpty ? "" : text + "\n").write(to: URL(fileURLWithPath: path), atomically: true, encoding: .utf8)
         let before = excludedBundles
         loadExcluded()
         if excludedBundles != before {
@@ -2482,7 +2482,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func tile(screen: NSScreen, windows: [WinInfo], refreshOverlays: Bool = true) {
         let sid = screenID(screen)
         let st = settingsFor(screen)
-        var windows = windows
         guard !windows.isEmpty else {
             lastTilesByScreen[sid] = []
             if refreshOverlays { refreshGrips(); refreshDimLayers(); refreshHighlights(); refreshDotHandles(); refreshStackMarkers() }
@@ -4741,7 +4740,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
            let dp = plainDownPoint, let dsid = plainDownScreenID {
             let dx = p.x - dp.x, dy = p.y - dp.y
             if dx * dx + dy * dy > 9,
-               let screen = NSScreen.screens.first(where: { screenID($0) == dsid }),
+               NSScreen.screens.contains(where: { screenID($0) == dsid }),
                let tiles = lastTilesByScreen[dsid], tiles.count > 1 {
                 let frames = tiles.map { $0.frame }
                 if let src = frames.firstIndex(where: { $0.contains(dp) }) {
