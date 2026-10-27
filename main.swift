@@ -574,6 +574,22 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var dividerDragPending: CGFloat? = nil
     var dividerDragScheduled = false
     var dividerDragCurrent: (screenID: CGDirectDisplayID, id: String, vertical: Bool)? = nil
+    // 缝拖动 phase 0 快照：拖前两侧格子帧 + 各成员实际帧 + 缝中心 + splitOverrides 原值。
+    // 拖动中成员不动，松手结算与整步撤销都以它为准；成员集合变了则取消本次拖动。
+    struct DividerDragSnapshot {
+        let sid: CGDirectDisplayID
+        let dividerID: String
+        let vertical: Bool
+        let seamCenter: CGFloat
+        let tiles: [(keys: Set<String>, frame: CGRect)]  // 两侧两格：成员 key 集 + 拖前格子帧
+        let memberKeys: Set<String>                      // 两侧两格全部成员 key（变化检测用）
+        let memberFrames: [String: CGRect]               // 各成员拖前实际帧（撤销落点用）
+        let splitOverrideKey: String
+        let splitOverrideValue: CGFloat?                 // 拖前 splitOverrides 原值（无则 nil，撤销时删键）
+        let snapLo: CGFloat?  // 快照实际帧顶回对 lo 的贡献（无则 nil）
+        let snapHi: CGFloat?  // 快照实际帧顶回对 hi 的贡献（无则 nil）
+    }
+    var dividerDragSnapshot: DividerDragSnapshot? = nil
     var hoverPanel: NSPanel!
 
     var hoverKey: String? = nil
@@ -1844,6 +1860,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 所以按钮已松开且 ID 还在，只可能是丢失，直接清掉，不影响正常拖动。
         if NSEvent.pressedMouseButtons == 0, draggingDividerID != nil {
             draggingDividerID = nil
+            dividerDragCurrent = nil
+            dividerDragPending = nil
+            dividerDragScheduled = false
+            dividerDragSnapshot = nil
             dragQuiet = false
             dividerRevertLogged = false
             refreshGrips()
@@ -3463,6 +3483,211 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // 拖缝：按当前格子重算两侧帧，先缩后涨，任意时刻不相交。不走 tile()，
     // 避免中途重新收集窗口把还没跟上的那一侧丢掉。
+    // 缝两侧两格在 tiles 里的下标（按当前帧与缝中心判定，1.5pt 容差，与旧顶回同口径）。
+    // side -1：竖线为左格（maxX == center-half），横线为 minY == center+half 的格；
+    // side 1：竖线为右格（minX == center+half），横线为 maxY == center-half 的格。
+    func dividerAdjacentIndices(tiles: [(stack: [WinInfo], frame: CGRect, top: WinInfo)], divider d: Divider, gap g: CGFloat) -> [Int] {
+        let half = g / 2
+        var out: [Int] = []
+        for (i, t) in tiles.enumerated() {
+            if d.vertical {
+                if abs(t.frame.maxX - (d.center - half)) < 1.5 || abs(t.frame.minX - (d.center + half)) < 1.5 { out.append(i) }
+            } else {
+                if abs(t.frame.minY - (d.center + half)) < 1.5 || abs(t.frame.maxY - (d.center - half)) < 1.5 { out.append(i) }
+            }
+        }
+        return out
+    }
+
+    // phase 0 快照：两侧两格成员各读一次实际帧（每拖一次，可接受），并算好
+    // 快照实际帧顶回（拖动中成员不动，顶回贡献是常量，不必每步重读）。
+    func makeDividerDragSnapshot(screenID sid: CGDirectDisplayID, dividerID: String, vertical: Bool) -> DividerDragSnapshot? {
+        guard let tiles = lastTilesByScreen[sid], tiles.count >= 2 else { return nil }
+        let frames = tiles.map { $0.frame }
+        let g = globalSettings.gap
+        let half = g / 2
+        guard let d = deriveDividers(frames: frames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else { return nil }
+        let mh = mainHeight()
+        var snapTiles: [(keys: Set<String>, frame: CGRect)] = []
+        var memberKeys = Set<String>()
+        var memberFrames: [String: CGRect] = [:]
+        var snapLo: CGFloat? = nil
+        var snapHi: CGFloat? = nil
+        for i in dividerAdjacentIndices(tiles: tiles, divider: d, gap: g) {
+            let t = tiles[i]
+            var keys = Set<String>()
+            for w in t.stack {
+                let key = winKey(w)
+                keys.insert(key)
+                memberKeys.insert(key)
+                memberFrames[key] = getFrame(w.element, screenHeight: mh) ?? lastPlacedFrames[key] ?? t.frame
+            }
+            snapTiles.append((keys: keys, frame: t.frame))
+            // 快照实际帧顶回：已超宽成员的拖前实际帧就是一堵固定的墙。
+            for w in t.stack {
+                guard let actual = memberFrames[winKey(w)] else { continue }
+                if d.vertical {
+                    if abs(t.frame.maxX - (d.center - half)) < 1.5, actual.maxX > t.frame.maxX + tileFitTolerance {
+                        snapLo = max(snapLo ?? -CGFloat.greatestFiniteMagnitude, actual.maxX + half)
+                    } else if abs(t.frame.minX - (d.center + half)) < 1.5, actual.minX < t.frame.minX - tileFitTolerance {
+                        snapHi = min(snapHi ?? CGFloat.greatestFiniteMagnitude, actual.minX - half)
+                    }
+                } else {
+                    if abs(t.frame.minY - (d.center + half)) < 1.5, actual.minY < t.frame.minY - tileFitTolerance {
+                        snapHi = min(snapHi ?? CGFloat.greatestFiniteMagnitude, actual.minY - half)
+                    } else if abs(t.frame.maxY - (d.center - half)) < 1.5, actual.maxY > t.frame.maxY + tileFitTolerance {
+                        snapLo = max(snapLo ?? -CGFloat.greatestFiniteMagnitude, actual.maxY + half)
+                    }
+                }
+            }
+        }
+        // 2×2 布局里一条合并后的缝两侧各有两格，adj 可能是 4 格；只要找得到两侧格子即可。
+        guard snapTiles.count >= 2 else { return nil }
+        let key = "\(sid)-\(globalSettings.kind.rawValue)-\(tiles.count)-\(dividerID)"
+        return DividerDragSnapshot(sid: sid, dividerID: dividerID, vertical: vertical, seamCenter: d.center,
+                                   tiles: snapTiles, memberKeys: memberKeys, memberFrames: memberFrames,
+                                   splitOverrideKey: key, splitOverrideValue: splitOverrides[key],
+                                   snapLo: snapLo, snapHi: snapHi)
+    }
+
+    // 取消本次缝拖动：不清已摆的顶部（就停在那儿），只清状态，让 tick 重排接管。
+    func cancelDividerDrag() {
+        dividerDragSnapshot = nil
+        dividerDragCurrent = nil
+        dividerDragPending = nil
+        dividerDragScheduled = false
+        draggingDividerID = nil
+        dragQuiet = false
+        dividerRevertLogged = false
+        refreshGrips()
+        log("divider drag cancelled: stack changed")
+    }
+
+    // 松手结算：两侧两格全部成员按最终帧摆一次，再读实际帧复核。
+    // 返回 true 表示落定（调用方记 split dragged），false 表示整步撤销或取消。
+    func settleDividerDrag(screen: NSScreen, dividerID: String, vertical: Bool) -> Bool {
+        let sid = screenID(screen)
+        guard let tiles = lastTilesByScreen[sid], tiles.count >= 2,
+              let snap = dividerDragSnapshot, snap.sid == sid, snap.dividerID == dividerID, snap.vertical == vertical else {
+            return false
+        }
+        let frames = tiles.map { $0.frame }
+        let g = globalSettings.gap
+        guard let d = deriveDividers(frames: frames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else {
+            cancelDividerDrag()
+            return false
+        }
+        let adj = dividerAdjacentIndices(tiles: tiles, divider: d, gap: g)
+        // 成员集合变了：取消，不摆不撤销，tick 重排接管。
+        var curKeys = Set<String>()
+        for i in adj { for w in tiles[i].stack { curKeys.insert(winKey(w)) } }
+        guard curKeys == snap.memberKeys else {
+            cancelDividerDrag()
+            return false
+        }
+        let mh = mainHeight()
+        struct SettleJob {
+            let el: AXUIElement
+            let old: CGRect
+            let new: CGRect
+            let key: String
+            let shrinking: Bool
+        }
+        var jobs: [SettleJob] = []
+        for i in adj {
+            let newF = tiles[i].frame
+            for w in tiles[i].stack { frameMotions.removeValue(forKey: winKey(w)) }
+            for w in tiles[i].stack {
+                let key = winKey(w)
+                let old = lastPlacedFrames[key] ?? tiles[i].frame
+                let shrinking = newF.width <= old.width + 0.5 && newF.height <= old.height + 0.5
+                jobs.append(SettleJob(el: w.element, old: old, new: newF, key: key, shrinking: shrinking))
+            }
+        }
+        for j in jobs where j.shrinking {
+            setSize(j.el, j.new.size)
+            setPosition(j.el, CGPoint(x: j.new.minX, y: mh - j.new.maxY))
+        }
+        for j in jobs where !j.shrinking {
+            let step = CGSize(width: min(j.old.width, j.new.width), height: min(j.old.height, j.new.height))
+            setSize(j.el, step)
+            setPosition(j.el, CGPoint(x: j.new.minX, y: mh - j.new.maxY))
+            setSize(j.el, j.new.size)
+        }
+        // 复核：读两侧两格全部成员实际帧，跨格真重叠（>1pt 双维）则整步撤销。
+        var actualList: [CGRect] = []
+        var actualOwners: [Int] = []
+        for i in adj {
+            for w in tiles[i].stack {
+                if let actual = getFrame(w.element, screenHeight: mh) {
+                    actualList.append(actual)
+                    actualOwners.append(i)
+                }
+            }
+        }
+        var actualOverlap = false
+        for a in actualList.indices {
+            for b in actualList.indices where b > a && actualOwners[b] != actualOwners[a] {
+                let inter = actualList[a].intersection(actualList[b])
+                if !inter.isNull, inter.width > 1, inter.height > 1 { actualOverlap = true }
+            }
+        }
+        if actualOverlap {
+            // 整步撤销：顶部 + 成员都送回 phase 0 快照的拖前帧，格子记录、手柄、
+            // splitOverrides 一并复位（沿用每拖节流的撤销日志）。
+            for j in jobs {
+                let target = snap.memberFrames[j.key] ?? j.old
+                let shrinkingBack = target.width <= j.new.width + 0.5 && target.height <= j.new.height + 0.5
+                if shrinkingBack {
+                    setSize(j.el, target.size)
+                    setPosition(j.el, CGPoint(x: target.minX, y: mh - target.maxY))
+                } else {
+                    let step = CGSize(width: min(j.new.width, target.width), height: min(j.new.height, target.height))
+                    setSize(j.el, step)
+                    setPosition(j.el, CGPoint(x: target.minX, y: mh - target.maxY))
+                    setSize(j.el, target.size)
+                }
+                lastPlacedFrames[j.key] = target
+            }
+            var restored = tiles
+            for i in tiles.indices {
+                let keys = Set(tiles[i].stack.map { winKey($0) })
+                if let s = snap.tiles.first(where: { $0.keys == keys }) { restored[i].frame = s.frame }
+            }
+            lastTilesByScreen[sid] = restored
+            if screenID(activeScreen()) == sid { lastTiles = restored }
+            if let v = snap.splitOverrideValue {
+                splitOverrides[snap.splitOverrideKey] = v
+            } else {
+                splitOverrides.removeValue(forKey: snap.splitOverrideKey)
+            }
+            if let panel = gripPanels["\(sid)-\(dividerID)"] {
+                if vertical {
+                    panel.setFrameOrigin(NSPoint(x: snap.seamCenter - panel.frame.width / 2, y: panel.frame.minY))
+                } else {
+                    panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: snap.seamCenter - panel.frame.height / 2))
+                }
+            }
+            for (i, f) in restored.map({ $0.frame }).enumerated() {
+                let dk = "\(sid):\(i)"
+                dimPanels[dk]?.setFrame(f, display: true)
+                if let hp = highlightPanels[dk] {
+                    hp.setFrame(f.insetBy(dx: -tileBorderPad, dy: -tileBorderPad), display: true)
+                }
+            }
+            raiseGrips()
+            if !dividerRevertLogged {
+                log("divider drag reverted: actual overlap after drop, seam stays")
+                dividerRevertLogged = true
+            }
+            return false
+        }
+        // 落定：写全部成员落点，跑虚高遗忘（只忘不学，沿用现有规则与守卫）。
+        for j in jobs { lastPlacedFrames[j.key] = j.new }
+        forgetInflatedMinsForDividerDrop(screen: screen, dividerID: dividerID, vertical: vertical)
+        return true
+    }
+
     func applyDividerDrag(screen: NSScreen, dividerID: String, vertical: Bool, proposed: CGFloat) {
         let sid = screenID(screen)
         guard var tiles = lastTilesByScreen[sid], tiles.count >= 2 else { return }
@@ -3471,45 +3696,49 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let g = globalSettings.gap
         let half = g / 2
         guard let d = deriveDividers(frames: oldFrames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else { return }
-        // 缝的活动界只取两项真实证据，不用已学值（stackNeed）预夹：
-        // 已学值可能陈旧（如音乐 980x0），会把缝提前顶住（hi 被定在 520，
-        // 当前缝中心正好 520，往右拖即被夹到零），且被夹住的缝永远放不进
-        // 更小的格子、也就永远没机会证伪它。demo 行为是拖到真最小尺寸才停住，
-        // 所以这里只留 deriveDividers 的几何界（160/120 绝对下限）与下面
-        // 的实际帧顶回（实时 AX 帧证据）；成员真缩不了致重叠时，落点实际复核
-        // 会把这一步撤销、缝停住；残留的超宽另有 tick 的成员级 overflow 兜底。
+        // 成员集合变了（窗口增减）：取消本次拖动，不清已摆的顶部，tick 重排接管。
+        let adj = dividerAdjacentIndices(tiles: tiles, divider: d, gap: g)
+        if let snap = dividerDragSnapshot, snap.sid == sid, snap.dividerID == dividerID, snap.vertical == vertical {
+            var curKeys = Set<String>()
+            for i in adj { for w in tiles[i].stack { curKeys.insert(winKey(w)) } }
+            guard curKeys == snap.memberKeys else {
+                cancelDividerDrag()
+                return
+            }
+        }
+        // 墙用最小尺寸证据顶，不摆完再撤销：
+        // ① deriveDividers 的几何界（160/120 绝对下限）；
+        // ② 快照实际帧顶回：拖动中成员不动，已超宽成员的拖前实际帧是一堵固定的墙，
+        //    phase 0 算好，不必每步重读；
+        // ③ effectiveMin 层：两侧两格各成员的 effectiveMin（AX 最小值与已学值取大）
+        //    取 max 作该格最小宽——音乐 980 这类真最小宽就顶在这里，而不是事后撤销。
+        //    每步每成员 1 次 AX 读值（只读最小尺寸属性，不摆窗）。
         var lo = d.minCenter
         var hi = d.maxCenter
-        // 实际帧顶回：查缝两侧两格的全部堆叠成员，不只顶部。已学尺寸为 0/未学的
-        // 成员没法用 160/120 兜底——它的真实最小尺寸只有实时 AX 帧能说出来；
-        // 若某成员实际帧已超出本格（被系统按真实最小尺寸顶住），就把缝顶回到实际边。
-        // 只查缝两侧两格，不全屏扫；动画中的成员跳过（弹簧过冲会误判）。
-        for t in tiles {
-            let side: Int
-            if d.vertical {
-                if abs(t.frame.maxX - (d.center - half)) < 1.5 { side = -1 }
-                else if abs(t.frame.minX - (d.center + half)) < 1.5 { side = 1 }
-                else { continue }
-            } else {
-                if abs(t.frame.minY - (d.center + half)) < 1.5 { side = -1 }
-                else if abs(t.frame.maxY - (d.center - half)) < 1.5 { side = 1 }
-                else { continue }
-            }
+        if let snap = dividerDragSnapshot, snap.sid == sid, snap.dividerID == dividerID, snap.vertical == vertical {
+            if let v = snap.snapLo { lo = max(lo, v) }
+            if let v = snap.snapHi { hi = min(hi, v) }
+        }
+        for i in adj {
+            let t = tiles[i]
+            var maxMin: CGFloat = 0
             for w in t.stack {
-                guard frameMotions[winKey(w)] == nil,
-                      let actual = getFrame(w.element, screenHeight: mainHeight()) else { continue }
-                if d.vertical {
-                    if side == -1, actual.maxX > t.frame.maxX + tileFitTolerance {
-                        lo = max(lo, actual.maxX + half)
-                    } else if side == 1, actual.minX < t.frame.minX - tileFitTolerance {
-                        hi = min(hi, actual.minX - half)
-                    }
-                } else {
-                    if side == -1, actual.minY < t.frame.minY - tileFitTolerance {
-                        hi = min(hi, actual.minY - half)
-                    } else if side == 1, actual.maxY > t.frame.maxY + tileFitTolerance {
-                        lo = max(lo, actual.maxY + half)
-                    }
+                let m = effectiveMin(for: w)
+                let v = vertical ? m.width : m.height
+                if v > maxMin { maxMin = v }
+            }
+            guard maxMin > 1 else { continue }
+            if vertical {
+                if abs(t.frame.maxX - (d.center - half)) < 1.5 {
+                    lo = max(lo, t.frame.minX + maxMin + half)
+                } else if abs(t.frame.minX - (d.center + half)) < 1.5 {
+                    hi = min(hi, t.frame.maxX - maxMin - half)
+                }
+            } else {
+                if abs(t.frame.minY - (d.center + half)) < 1.5 {
+                    hi = min(hi, t.frame.maxY - maxMin - half)
+                } else if abs(t.frame.maxY - (d.center - half)) < 1.5 {
+                    lo = max(lo, t.frame.minY + maxMin + half)
                 }
             }
         }
@@ -3544,25 +3773,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let key: String
             let shrinking: Bool
         }
+        // 拖动中只摆每格看得见的顶部一扇：堆叠成员被顶部完全盖住，拖动中不动
+        // 它们、视觉上无差别；lastPlacedFrames 也只写顶部，成员留到松手结算。
+        // 飞行中的弹簧仍要取消，否则 tick 会把窗往旧目的地拖、与缝打架。
         var jobs: [Job] = []
-        for (i, t) in tiles.enumerated() {
+        for i in adj {
             let newF = newFrames[i]
-            // 帧没变的格子跳过，不重放：3 格以上布局时缝只动两侧两格，
-            // 其余格成员每事件白白各吃 2–3 次 AX。飞行中的弹簧仍要取消，
-            // 否则它会在 tick 里把窗往旧目的地拖、与缝打架。
-            for w in t.stack { frameMotions.removeValue(forKey: winKey(w)) }
-            guard abs(newF.width - oldFrames[i].width) > 0.5 || abs(newF.height - oldFrames[i].height) > 0.5
-                || abs(newF.minX - oldFrames[i].minX) > 0.5 || abs(newF.minY - oldFrames[i].minY) > 0.5 else {
-                tiles[i].frame = newF
-                continue
-            }
-            for w in t.stack {
-                let key = winKey(w)
-                let old = lastPlacedFrames[key] ?? t.frame
-                let shrinking = newF.width <= old.width + 0.5 && newF.height <= old.height + 0.5
-                jobs.append(Job(el: w.element, old: old, new: newF, key: key, shrinking: shrinking))
-            }
+            for w in tiles[i].stack { frameMotions.removeValue(forKey: winKey(w)) }
             tiles[i].frame = newF
+            let top = tiles[i].top
+            let key = winKey(top)
+            let old = lastPlacedFrames[key] ?? oldFrames[i]
+            let shrinking = newF.width <= old.width + 0.5 && newF.height <= old.height + 0.5
+            jobs.append(Job(el: top.element, old: old, new: newF, key: key, shrinking: shrinking))
         }
         let mh = mainHeight()
         for j in jobs where j.shrinking {
@@ -3575,24 +3798,18 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             setPosition(j.el, CGPoint(x: j.new.minX, y: mh - j.new.maxY))
             setSize(j.el, j.new.size)
         }
-        // 落点后实际复核：意图帧干净不代表实际帧干净——AX 会把窗口按真实最小
-        // 尺寸顶住（变大、位置已移到新格），意图帧的 framesOverlap 拦不住。
-        // 重读缝两侧两格成员的实际帧，若相邻两格确实重叠（交集宽高均 >1pt，
-        // 与 framesOverlap 同口径），撤销这一步拖动，不把重叠状态存下来。
+        // 每步复核只针对两扇顶部：意图帧干净不代表实际帧干净——AX 会把窗口按真实
+        // 最小尺寸顶住（变大、位置已移到新格），意图帧的 framesOverlap 拦不住。
+        // 成员拖动中没动，不可能新重叠，读它们是纯浪费。两扇顶部确实重叠
+        // （交集宽高均 >1pt，与 framesOverlap 同口径）则撤销这一步，不把重叠存下来。
         // 注意：此处 lastPlacedFrames 与 splitOverrides 尚未写入本步新值，
-        // 撤销只需把 AX 落点与面板送回拖动前，不用恢复这两处记录。
+        // 撤销只需把顶部 AX 落点与面板送回上一步，不用恢复这两处记录。
         var actualList: [CGRect] = []
         var actualOwners: [Int] = []
-        for (i, o) in oldFrames.enumerated() {
-            let adjacent = d.vertical
-                ? abs(o.maxX - (d.center - half)) < 1.5 || abs(o.minX - (d.center + half)) < 1.5
-                : abs(o.minY - (d.center + half)) < 1.5 || abs(o.maxY - (d.center - half)) < 1.5
-            guard adjacent else { continue }
-            for w in tiles[i].stack {
-                if let actual = getFrame(w.element, screenHeight: mh) {
-                    actualList.append(actual)
-                    actualOwners.append(i)
-                }
+        for i in adj {
+            if let actual = getFrame(tiles[i].top.element, screenHeight: mh) {
+                actualList.append(actual)
+                actualOwners.append(i)
             }
         }
         var actualOverlap = false
@@ -3640,10 +3857,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return
         }
+        // 成功一步只写两扇顶部的落点；成员的落点与虚高遗忘留到松手结算时一次做。
         for j in jobs { lastPlacedFrames[j.key] = j.new }
-        // 虚高遗忘不在每步做：每步给变格成员各读一次帧是纯浪费（约 32 次 AX），
-        // 且缝拖动中已学值本来就不再用来预夹。改到松开（phase 2）时跑一次，
-        // 用落点时的一次读帧结算全部成员，只忘不学的规则不变。
         lastTilesByScreen[sid] = tiles
         if screenID(activeScreen()) == sid { lastTiles = tiles }
         let frac = vertical
@@ -3704,6 +3919,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             self.dividerDragScheduled = false
                             self.dragQuiet = true
                             self.dividerRevertLogged = false
+                            self.dividerDragSnapshot = self.makeDividerDragSnapshot(screenID: dd.screenID, dividerID: dd.id, vertical: dd.vertical)
                         case 1:
                             // 事件合并：只记最新位置，不直接跑 applyDividerDrag。
                             // 主队列异步块用最新位置跑一步；多个事件到达时只覆盖
@@ -3736,16 +3952,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                     self.applyDividerDrag(screen: scr, dividerID: cur.id, vertical: cur.vertical, proposed: pending)
                                 }
                             }
+                            // 松手结算：两侧两格全部成员按最终帧摆一次并复核；整步撤销
+                            // 或成员集合变化时 settle 返回 false，不记 split dragged。
+                            var settled = false
                             if let cur = self.dividerDragCurrent,
                                let scr = NSScreen.screens.first(where: { self.screenID($0) == cur.screenID }) {
-                                self.forgetInflatedMinsForDividerDrop(screen: scr, dividerID: cur.id, vertical: cur.vertical)
+                                settled = self.settleDividerDrag(screen: scr, dividerID: cur.id, vertical: cur.vertical)
                             }
+                            self.dividerDragSnapshot = nil
                             self.dividerDragCurrent = nil
                             self.draggingDividerID = nil
                             self.dragQuiet = false
                             self.dividerRevertLogged = false
                             self.refreshGrips()
-                            log("split dragged: \(dd.id)")
+                            if settled { log("split dragged: \(dd.id)") }
                             self.refreshPanel()
                         }
                     }
