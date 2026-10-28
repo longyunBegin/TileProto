@@ -434,6 +434,16 @@ func minimapLayout(work: CGRect, frames: [CGRect], canvas: CGRect) -> [CGRect] {
     }
 }
 
+/// 排进去之前要不要浮出平铺。比某一格大的最小尺寸仍然进那一格的叠。
+/// 只有整屏那一格也装不下，才在布局时浮走。放进去之后如果实际帧盖住另一格，另走盖缝检查。
+func shouldFloatBeforePlace(minSize: CGSize, slot: CGRect, workCell: CGRect) -> Bool {
+    let fitsWork = frameContained(in: workCell, proposed: workCell, minSize: minSize) != nil
+    let fitsSlot = frameContained(in: slot, proposed: slot, minSize: minSize) != nil
+    if !fitsWork { return true }
+    if !fitsSlot { return false }
+    return false
+}
+
 /// 实际帧探出自己的格子，并且探到了另一格的矩形里。同一格里的堆叠不算。
 func frameCrossesPane(_ actual: CGRect, cell: CGRect, neighbor: CGRect, tolerance: CGFloat = tileFitTolerance) -> Bool {
     let over = max(cell.minX - actual.minX, cell.minY - actual.minY,
@@ -444,9 +454,9 @@ func frameCrossesPane(_ actual: CGRect, cell: CGRect, neighbor: CGRect, toleranc
     return inter.width > 1 && inter.height > 1
 }
 
-/// 这扇窗装不进分给它的格子：已知最小尺寸过大，或者实际帧已经探出格子。
-func windowIsSeamOffender(minSize: CGSize, cell: CGRect, actual: CGRect, tolerance: CGFloat = tileFitTolerance) -> Bool {
-    if slotShortfall(minSize, cell, tolerance: tolerance) > 0 { return true }
+/// 拖缝时只把实际帧已经探出格子的窗口当成要挪走的那一扇。
+/// 最小尺寸比格子大、但实际帧还在格子里，留在这一叠，不因此浮出平铺。
+func windowIsSeamOffender(cell: CGRect, actual: CGRect, tolerance: CGFloat = tileFitTolerance) -> Bool {
     let over = max(cell.minX - actual.minX, cell.minY - actual.minY,
                    actual.maxX - cell.maxX, actual.maxY - cell.maxY)
     return over > tolerance
@@ -4055,8 +4065,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let frames = framesFor(stacks: fitStacks, screen: screen, sid: sid)
         // 整叠交换置换：frames 按未置换的叠算（每格几何固定、缝记忆按格），只换每格里装哪一叠。
-        // 整屏装不下、或者装不进分到的这一格，都浮走。留在小格里会探过缝盖住邻居。
-        // 栈顶下标按计算格存，随叠走。
+        // 只有整屏那一格也装不下才浮走。比当前小格大的窗口仍写入这格，留在这一叠里，用芯片切换。
+        // 放进去之后如果实际帧盖住另一格，tick 再把那一扇浮走。栈顶下标按计算格存，随叠走。
         let swapPerm = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: fitStacks.count)
         if swapPerm == Array(0..<fitStacks.count) { tileSwapPermByScreen.removeValue(forKey: sid) } else { tileSwapPermByScreen[sid] = swapPerm }
         let displayStacks = swapPerm.map { fitStacks[$0] }
@@ -4070,14 +4080,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for w in stack {
                 let key = winKey(w)
                 let minSize = effectiveMin(for: w)
-                if frameContained(in: workCell, proposed: workCell, minSize: minSize) == nil
-                    || frameContained(in: slot, proposed: slot, minSize: minSize) == nil {
+                if shouldFloatBeforePlace(minSize: minSize, slot: slot, workCell: workCell) {
                     floatOversized(w, on: screen)
-                    log("cross-pane float: \(w.appName) does not fit pane \(i)")
                     continue
                 }
+                // 比这一格大的最小尺寸不在这里浮走。弹簧仍落到格子矩形；传 .zero 是因为
+                // frameContained 对过大的最小值会直接拒绝，动画会跳过中间帧。
+                let motionMin = frameContained(in: slot, proposed: slot, minSize: minSize) == nil ? CGSize.zero : minSize
                 let preSize = getSize(w.element)
-                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: minSize)
+                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: motionMin)
                 lastPlacedFrames[key] = slot
                 placedStacks[i].append(w)
             }
@@ -4785,8 +4796,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for b in samples.indices where b > a && samples[b].tile != samples[a].tile {
                 let inter = samples[a].actual.intersection(samples[b].actual)
                 guard !inter.isNull, inter.width > 1, inter.height > 1 else { continue }
-                let aOff = windowIsSeamOffender(minSize: effectiveMin(for: samples[a].window), cell: samples[a].cell, actual: samples[a].actual)
-                let bOff = windowIsSeamOffender(minSize: effectiveMin(for: samples[b].window), cell: samples[b].cell, actual: samples[b].actual)
+                let aOff = windowIsSeamOffender(cell: samples[a].cell, actual: samples[a].actual)
+                let bOff = windowIsSeamOffender(cell: samples[b].cell, actual: samples[b].actual)
                 pairs.append((offenderA: aOff, offenderB: bOff))
                 if aOff { offenders[winKey(samples[a].window)] = samples[a].window }
                 if bOff { offenders[winKey(samples[b].window)] = samples[b].window }
@@ -7672,9 +7683,15 @@ private func runTileProtoSelfTest() {
     tileProtoCheck(frameCrossesPane(spilling, cell: cell, neighbor: neighbor), "a window wider than its pane crosses into the neighbor")
     tileProtoCheck(!frameCrossesPane(CGRect(x: 0, y: 0, width: 404, height: 300), cell: cell, neighbor: neighbor), "four points of overhang stays inside the tolerance")
     tileProtoCheck(!frameCrossesPane(CGRect(x: 0, y: 0, width: 406, height: 300), cell: cell, neighbor: neighbor), "overhang that stops in the gap does not count as covering the next pane")
-    tileProtoCheck(windowIsSeamOffender(minSize: CGSize(width: 900, height: 200), cell: cell, actual: inside), "a minimum wider than the pane is an offender")
-    tileProtoCheck(windowIsSeamOffender(minSize: .zero, cell: cell, actual: spilling), "an actual frame past the pane is an offender")
-    tileProtoCheck(!windowIsSeamOffender(minSize: CGSize(width: 200, height: 200), cell: cell, actual: inside), "a window that fits is not an offender")
+    tileProtoCheck(windowIsSeamOffender(cell: cell, actual: spilling), "an actual frame past the pane is an offender")
+    tileProtoCheck(!windowIsSeamOffender(cell: cell, actual: inside), "a frame that stays in the pane is not an offender")
+    tileProtoCheck(!windowIsSeamOffender(cell: cell, actual: inside), "a large minimum alone does not make a contained frame an offender")
+    let busySlot = CGRect(x: 8, y: 8, width: 595, height: 435)
+    let busyWork = CGRect(x: 0, y: 0, width: 1512, height: 893)
+    tileProtoCheck(!shouldFloatBeforePlace(minSize: CGSize(width: 1114, height: 500), slot: busySlot, workCell: busyWork), "a minimum wider than one pane still stays in the stack")
+    tileProtoCheck(!shouldFloatBeforePlace(minSize: CGSize(width: 980, height: 600), slot: busySlot, workCell: busyWork), "a tall minimum that fits the screen stays in the stack")
+    tileProtoCheck(!shouldFloatBeforePlace(minSize: CGSize(width: 200, height: 200), slot: busySlot, workCell: busyWork), "a window that fits its pane stays in the stack")
+    tileProtoCheck(shouldFloatBeforePlace(minSize: CGSize(width: 1600, height: 400), slot: busySlot, workCell: busyWork), "a minimum wider than the whole screen floats")
     tileProtoCheck(!seamMustRevert([]), "no overlap does not revert the seam")
     tileProtoCheck(!seamMustRevert([(offenderA: true, offenderB: false)]), "one offender does not revert the seam")
     tileProtoCheck(!seamMustRevert([(offenderA: true, offenderB: true)]), "two offenders do not revert the seam")
