@@ -5,11 +5,14 @@ import QuartzCore
 
 // TileProto：菜单栏自动平铺。操作只在鼠标和菜单栏面板上。
 // 原理：Accessibility API（AXUIElement）枚举窗口并改 frame。
-//  1. 布局：Grid / Columns / Rows / Side，数量 1–4，主格份额与间距可调。
-//     格子数 = min(窗口数, 上限, 4)。间距同时是四边 inset。装不下的数量变灰。
-//  2. 放不进格子的窗口先并进装得下的格子；整屏都装不下才按最小尺寸居中浮动。
-//     写入 AX 的帧不会超出该格，避免窗口从格子里探出去。
-//  3. 窗口多于格子时堆进活动格子。橙色握把点按轮换；悬停条上层是芯片，
+//  1. 布局：Grid / Columns / Rows / Side，数量 1–4，默认 4。主格份额与间距可调。
+//     格子数 = min(窗口数, 上限, 这一屏装得下的档, 4)。间距同时是四边 inset。装不下的数量变灰。
+//     点选布局时，上限若低于这一族要露出来的格数就升上去。旧默认 3 在第一次启动时同样升一次。
+//     Grid 用 4 格才不会和 Side 叠成同一张图。
+//  2. 放不进当前格的窗口，只挪到同一布局里装得下、并且不会少掉一格的另一格。
+//     不为了最小尺寸把整屏并成一格。整屏都装不下的那一扇才居中浮动。
+//     写入 AX 的帧是该格的矩形，不会超出该格。
+//  3. 窗口多于格子时按顺序分进每一格，每格一叠。橙色握把点按轮换；悬停条上层是芯片，
 //     下层是 Primary / Focus / Float。界面不放键帽。
 //     Option+Command 拖到某格子上时，即使刚好满格也并进去，空出的格子收掉。
 //     Control+Command 仍是交换，不是进叠。
@@ -60,6 +63,11 @@ let tileFitTolerance: CGFloat = 4
 // 容量按份额 1/2 的等分格判断。主窗份额只在同一档数量里重分宽高，不把数量变灰。
 let layoutCellMinW: CGFloat = 400
 let layoutCellMinH: CGFloat = 300
+// 新装时的数量上限。4 是面板能选的最大档。
+// 每一族再用 effectiveTileLimit 收到这块屏装得下的格数：
+// MacBook 上 Grid 是 4、Columns 是 3、Rows 是 2、Side 是 3，四族外形互不相同。
+// 上限停在 3 时，Grid 的三格和 Side 的三格是同一张图。
+let defaultTileLimit = 4
 let tileSpringDuration: CFTimeInterval = 0.62
 let hoverShowDelay: CFTimeInterval = 0.15
 let hoverArmDelay: CFTimeInterval = 0.40
@@ -104,9 +112,10 @@ func maxSlotShortfall(needs: [CGSize], groups: [[Int]], frames: [CGRect]) -> CGF
     return worst
 }
 
-/// 把装不下的窗口并进其它格子。先挪超限的那一组；格子数量不变、格子仍然不够大时，
-/// 再把整格并进邻居，从而减少格子。并到只剩一整屏仍装不下就列入 floated。
-/// bound 把手动堆叠绑在一起：member → root，合并时整组跟着走。
+/// 把装不进当前格子的窗口挪到同一布局里装得下的另一格。
+/// 格子数是布局族的形状，这里不减少它：源格会被搬空、或者目的格并不更大时，都不搬。
+/// 只有整屏那一格也装不下，才把那一扇放进 floated。其余窗口留在自己的格子里叠着。
+/// bound 把手动堆叠绑在一起：member → root，能搬时整组跟着走。
 func planTileFit(
     needs: [CGSize],
     groups: [[Int]],
@@ -114,8 +123,10 @@ func planTileFit(
     frames: ([[Int]]) -> [CGRect],
     maxSteps: Int = 8
 ) -> (groups: [[Int]], floated: [Int]) {
-    var groups = groups
+    var groups = groups.filter { !$0.isEmpty }
     var floated: [Int] = []
+    // 这一轮已经确认「留在原格」的窗口。跳过后继续看别的窗口，避免一扇很宽的窗挡住后面还能搬家的窗。
+    var skipped: Set<Int> = []
     func root(of id: Int) -> Int {
         var seen = Set<Int>()
         var cur = id
@@ -144,14 +155,27 @@ func planTileFit(
         }
         return trial
     }
-    for _ in 0..<maxSteps {
+    func signature(_ groups: [[Int]]) -> String {
+        groups.map { $0.sorted().map(String.init).joined(separator: ",") }.joined(separator: "/")
+    }
+    func fitsWorkArea(_ id: Int) -> Bool {
+        let solo = frames([[id]])
+        return solo.count == 1 && slotShortfall(needs[id], solo[0]) == 0
+    }
+    // 见过的分法。搬家必须落到新的分法上，防止来回搬。
+    var seen: Set<String> = [signature(groups)]
+    let budget = max(maxSteps, max(needs.count, 1) * 2)
+    var steps = 0
+    while steps < budget {
+        steps += 1
+        if groups.isEmpty { break }
         let current = frames(groups)
         guard current.count == groups.count else { break }
         var worstAmt: CGFloat = 0
         var worstGroup = -1
         var worstID = -1
         for (gi, group) in groups.enumerated() {
-            for id in group where needs.indices.contains(id) {
+            for id in group where needs.indices.contains(id) && !skipped.contains(id) && !floated.contains(id) {
                 let short = slotShortfall(needs[id], current[gi])
                 if short > worstAmt {
                     worstAmt = short
@@ -161,42 +185,78 @@ func planTileFit(
             }
         }
         if worstID < 0 { break }
+        // 只剩一整屏时，装不下就浮动。这里不再有别的格子可以收留它。
         if groups.count <= 1 {
             floated.append(worstID)
             groups[worstGroup].removeAll { $0 == worstID }
             if groups[worstGroup].isEmpty { groups.remove(at: worstGroup) }
+            if !seen.insert(signature(groups)).inserted { break }
             continue
         }
         let moving = component(worstID, inside: groups)
-        let whole = groups[worstGroup]
         var best: [[Int]]?
         var bestScore = worstAmt
-        func consider(_ trial: [[Int]]?) {
-            guard let trial else { return }
-            let score = maxSlotShortfall(needs: needs, groups: trial, frames: frames(trial))
-            let improves = score + 0.5 < bestScore
-            let moreTiles = best.map { trial.count > $0.count } ?? false
-            let keepsMoreTiles = moreTiles && score <= bestScore + 0.5 && score + 0.5 < worstAmt
-            if improves || keepsMoreTiles {
+        for host in groups.indices where host != worstGroup {
+            // relocated 会丢掉搬空的格子。格子数变了就拒绝：那是把布局并掉。
+            guard let trial = relocated(moving, host: host, groups: groups) else { continue }
+            guard trial.count == groups.count else { continue }
+            let trialFrames = frames(trial)
+            guard trialFrames.count == trial.count else { continue }
+            let score = maxSlotShortfall(needs: needs, groups: trial, frames: trialFrames)
+            if score + 0.5 < bestScore {
                 bestScore = score
                 best = trial
             }
         }
-        for host in groups.indices where host != worstGroup {
-            consider(relocated(moving, host: host, groups: groups))
-            if Set(whole) != Set(moving) {
-                consider(relocated(whole, host: host, groups: groups))
-            }
-        }
         if let best {
+            guard seen.insert(signature(best)).inserted else { break }
             groups = best
-        } else {
-            floated.append(worstID)
-            groups[worstGroup].removeAll { $0 == worstID }
-            if groups[worstGroup].isEmpty { groups.remove(at: worstGroup) }
+            skipped.removeAll()
+            continue
         }
+        if !fitsWorkArea(worstID) {
+            floated.append(worstID)
+            for i in groups.indices {
+                groups[i].removeAll { $0 == worstID }
+            }
+            groups.removeAll { $0.isEmpty }
+            if !seen.insert(signature(groups)).inserted { break }
+            continue
+        }
+        // 整屏装得下，但没有任何一格能在保持格数的前提下装下它。留在原格。
+        skipped.insert(worstID)
     }
     return (groups, floated)
+}
+
+/// 第 0 个窗口进第 0 格，前 tileCount 个窗口各开一格，其后的窗口按顺序轮流分进每一格。
+/// 17 扇窗、3 格时是 6、6、5，不会 15 扇堆在一格里。
+func overflowTileIndex(windowOrdinal: Int, tileCount: Int) -> Int {
+    let n = tileCount > 0 ? tileCount : 1
+    let ordinal = windowOrdinal > 0 ? windowOrdinal : 0
+    if ordinal < n { return ordinal }
+    return (ordinal - n) % n
+}
+
+/// 这一族要露出来才叫这个布局的格数。Grid 要 4，否则和 Side 的三格是同一张图。
+/// Columns / Rows / Side 从 3 格起才不是「左右对半分」或「一整屏」。
+func familyShapeCount(_ kind: LayoutKind) -> Int {
+    switch kind {
+    case .grid: return 4
+    case .columns, .rows, .side: return 3
+    }
+}
+
+/// 点选这一族时，至少要达到的格数：想要的外形，再收到这块工作区装得下的档。
+func visiblePaneTarget(kind: LayoutKind, vf: CGRect, gap: CGFloat) -> Int {
+    effectiveTileLimit(familyShapeCount(kind), kind: kind, vf: vf, gap: gap)
+}
+
+/// 点选布局族之后的上限。只升不降：用户已经选过更大的上限时留着，换一块屏还能用。
+/// 屏幕装不下的档由 effectiveTileLimit 在平铺时收回，不写进这个返回值。
+func tileLimitForFamilyChange(saved: Int, kind: LayoutKind, vf: CGRect, gap: CGFloat) -> Int {
+    let savedClamped = min(max(saved, 1), 4)
+    return max(savedClamped, visiblePaneTarget(kind: kind, vf: vf, gap: gap))
 }
 
 // 份额为 Half（0.5）时条带按份数等分，三列不会变成「第一列占一半」。
@@ -631,7 +691,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem!
     var autoTile = true
     var autoOffPlacedKeys: Set<String> = []  // 关自动平铺后已见过的窗口：只给此后新开的窗口居中一次
-    var tileLimit = 3
+    var tileLimit = defaultTileLimit
     var noPeek = false
     var dimStrength: CGFloat = 0.50
     var showBorders = false  // 默认关。打开后描边画在缝里，不盖住窗口内容。
@@ -818,7 +878,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var lastPlacedFrames: [String: CGRect] = [:]  // winKey -> frame
     // C 批：多显示器 + Spaces（每屏独立设置、窗口集合与磁贴 frame；单屏时与旧行为一致）
     struct ScreenSettings {
-        var tileLimit = 3
+        var tileLimit = defaultTileLimit
         var kind: LayoutKind = .grid
         var share: CGFloat = 0.5
         var gap: CGFloat = 8
@@ -1177,7 +1237,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         windowsLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         let captionSpacer = NSView()
         captionSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        layoutCaptionLabel = sectionLabel("Grid · One big, two small")
+        layoutCaptionLabel = sectionLabel("Grid · Grid of four")
         layoutCaptionLabel.alignment = .right
         layoutCaptionLabel.lineBreakMode = .byTruncatingTail
         layoutCaptionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1261,7 +1321,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         stack.addArrangedSubview(w288(gapRow))
         let whenFullRow = hRow(distribution: .fillEqually, spacing: 6)
         for (title, tag, tip) in [
-            ("Stack in tile", WhenFull.stack.rawValue, "New windows join the tile you're in."),
+            ("Stack in tiles", WhenFull.stack.rawValue, "Extra windows spread across the tiles of this layout."),
             ("Float in middle", WhenFull.float.rawValue, "New windows float in the middle until there's room."),
         ] {
             let b = NSButton(title: title, target: self, action: #selector(panelWhenFull(_:)))
@@ -1666,17 +1726,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !fits { overflow += 1 }
         }
         if overflow == 0 { return nil }
-        let noun = overflow == 1 ? "window" : "windows"
-        return "\(overflow) \(noun) will stack or float. A cell is smaller than the window minimum."
+        if overflow == 1 {
+            return "1 window is larger than its cell. It stays stacked in the layout."
+        }
+        return "\(overflow) windows are larger than their cells. They stay stacked in the layout."
     }
 
     func applyLayoutKind(_ kind: LayoutKind) {
         var st = globalSettings
-        st.kind = kind
         let screen = activeScreen()
+        st.kind = kind
+        // 只升不降。Grid 从 3 升到 4 之后，Side 仍按这块屏能装下的 3 格画，两族才分开。
+        st.tileLimit = tileLimitForFamilyChange(saved: st.tileLimit, kind: kind, vf: screen.visibleFrame, gap: st.gap)
         setSettingsFor(st, screen: screen)
         let fitted = maxFitCount(kind: kind, on: screen)
-        log("layout -> \(layoutName(kind)) fitted=\(fitted)")
+        log("layout -> \(layoutName(kind)) fitted=\(fitted) limit=\(st.tileLimit)")
         if let note = capacityNote(kind: kind, fitted: fitted) {
             showToast(layoutName(kind), detail: note, on: screen)
         } else {
@@ -1717,9 +1781,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         st.whenFull = mode
         setSettingsFor(st, screen: activeScreen())
         log("whenFull -> \(mode == .stack ? "stack" : "float")")
-        showToast(mode == .stack ? "Stack in the active tile" : "Float in the middle",
+        showToast(mode == .stack ? "Stack across tiles" : "Float in the middle",
                   detail: mode == .stack
-                    ? "A new window joins the tile you’re in."
+                    ? "Extra windows spread across the tiles of this layout."
                     : "A new window floats in the middle until there’s room.",
                   on: activeScreen())
         forceTile()
@@ -1903,6 +1967,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if d.object(forKey: "tileproto.whenFull") != nil {
             st.whenFull = WhenFull(rawValue: d.integer(forKey: "tileproto.whenFull")) ?? .stack
         }
+        // 旧默认上限是 3。Grid 在 3 格时和 Side 是同一张图，所以只在第一次启动、
+        // 并且当时存的就是 3 时，升到这一族要露出来的格数。用户之后再调回 3 会留下。
+        var saveRaisedLimit = false
+        if !d.bool(forKey: "tileproto.familyPaneRaised"),
+           let screen = NSScreen.main ?? NSScreen.screens.first {
+            if st.tileLimit == 3 {
+                let raised = tileLimitForFamilyChange(saved: st.tileLimit, kind: st.kind, vf: screen.visibleFrame, gap: st.gap)
+                if raised != st.tileLimit {
+                    log("tileLimit \(st.tileLimit) -> \(raised) so \(layoutFamilyName(st.kind)) can show its panes")
+                    st.tileLimit = raised
+                    saveRaisedLimit = true
+                }
+            }
+            d.set(true, forKey: "tileproto.familyPaneRaised")
+        }
         globalSettings = st
         tileLimit = st.tileLimit
         if d.object(forKey: "tileproto.noPeek") != nil { noPeek = d.bool(forKey: "tileproto.noPeek") }
@@ -1912,6 +1991,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if d.object(forKey: "tileproto.borders") != nil { showBorders = d.bool(forKey: "tileproto.borders") }
         hoverFocus = d.bool(forKey: "tileproto.hoverFocus")
+        if saveRaisedLimit { saveLayoutSettings() }
     }
 
     func saveLayoutSettings() {
@@ -2620,10 +2700,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    // 把窗口分到各磁贴：前 t 个窗口每磁贴一个，多余的堆进活动磁贴。
-    // 活动磁贴 = 最前窗口所在的磁贴；最前窗口不在磁贴内（或没有）时为第 0 个。
+    // 把窗口分到各磁贴：前 t 个窗口每磁贴一个，其余按窗口顺序轮流分进这 t 格。
+    // 活动磁贴只决定高亮，不决定多余窗口堆进哪一格，避免焦点一变就把整屏重分。
     // 窗口顺序（⌘ 交换会改这张表）：先按 windowOrder 排，再把 Primary 移到首位；
-    // 新窗口追加到末尾（未满时自成一格，满时进活动磁贴堆叠），消失的窗口剔除。
+    // 新窗口追加到末尾（未满时自成一格，满时按顺序进入下一格），消失的窗口剔除。
     // C 批：只追加新窗口，不裁剪——按屏调用 computeTiles 时不能误删别屏的顺序；
     // 消失窗口的裁剪由 tileAll 按全屏集合统一做
     func mergeWindowOrder(_ windows: [WinInfo]) {
@@ -2725,10 +2805,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if st.whenFull == .float {
                 overflow = Array(rootPool[t...])
             } else {
-                for w in rootPool[t...] { stacks[active].append(w) }
+                for (ordinal, w) in rootPool.enumerated() where ordinal >= t {
+                    stacks[overflowTileIndex(windowOrdinal: ordinal, tileCount: t)].append(w)
+                }
             }
         }
         if !roots.isEmpty {
+            // 手动堆叠的 host 不在本屏格子里时，按 host 分组后继续轮流分格。
+            // 同一个 host 的成员进同一格。host 键排序，分法不随字典遍历顺序变。
+            var orphans: [String: [WinInfo]] = [:]
             for w in windows {
                 guard let host = stackedOnto[winKey(w)] else { continue }
                 if let ti = stacks.firstIndex(where: { $0.contains { winKey($0) == host } }) {
@@ -2736,8 +2821,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 } else if st.whenFull == .float {
                     overflow.append(w)
                 } else {
-                    stacks[active].append(w)
+                    orphans[host, default: []].append(w)
                 }
+            }
+            var ordinal = rootPool.count
+            for host in orphans.keys.sorted() {
+                let tile = overflowTileIndex(windowOrdinal: ordinal, tileCount: t)
+                for w in orphans[host] ?? [] {
+                    stacks[tile].append(w)
+                }
+                ordinal += 1
             }
         }
         return (stacks, active, overflow)
@@ -3116,25 +3209,28 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let frames = framesFor(stacks: fitStacks, screen: screen, sid: sid)
         // 整叠交换置换：frames 按未置换的叠算（每格几何固定、缝记忆按格），只换每格里装哪一叠。
-        // 新格装不下的成员仍按老规则浮动；栈顶下标按计算格存，构造三元组时经 permSrcSlot 翻译，随叠走。
+        // 整屏装不下的成员才浮动；装不进当前小格的仍写入这格。栈顶下标按计算格存，随叠走。
         let swapPerm = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: fitStacks.count)
         if swapPerm == Array(0..<fitStacks.count) { tileSwapPermByScreen.removeValue(forKey: sid) } else { tileSwapPermByScreen[sid] = swapPerm }
         let displayStacks = swapPerm.map { fitStacks[$0] }
         let displayActive = displayStacks.firstIndex(where: { $0.contains(where: { winKey($0) == activeTopKey }) }) ?? active
         let animateMoves = draggingDividerID == nil
+        // 整屏那一格。装不进它的窗口才浮动。装不进当前小格的窗口仍然写入小格的矩形。
+        let workCell = layoutFrames(count: 1, vf: vf, kind: st.kind, share: st.share, gap: st.gap).first ?? vf
         var placedStacks: [[WinInfo]] = Array(repeating: [], count: displayStacks.count)
         for (i, stack) in displayStacks.enumerated() {
             let slot = frames.indices.contains(i) ? frames[i] : vf
             for w in stack {
                 let key = winKey(w)
                 let minSize = effectiveMin(for: w)
-                // 装不进这一格就居中浮动，并从这一格拿掉，避免半截探进邻居。
-                guard frameContained(in: slot, proposed: slot, minSize: minSize) != nil else {
+                if frameContained(in: workCell, proposed: workCell, minSize: minSize) == nil {
                     floatOversized(w, on: screen)
                     continue
                 }
+                // 最小尺寸比这格大时，弹簧仍落到这格。传 .zero 是因为 frameContained 对过大的最小值会直接拒绝，动画会跳过中间帧。
+                let motionMin = frameContained(in: slot, proposed: slot, minSize: minSize) == nil ? CGSize.zero : minSize
                 let preSize = getSize(w.element)
-                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: minSize)
+                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: motionMin)
                 lastPlacedFrames[key] = slot
                 placedStacks[i].append(w)
             }
@@ -6218,24 +6314,36 @@ private func runTileProtoSelfTest() {
         CGSize(width: 200, height: 200),
         CGSize(width: 200, height: 200),
     ]
+    let narrow = layoutFrames(count: 3, vf: vf, kind: .columns, share: 0.5, gap: gap)
+    tileProtoCheck(narrow[0].width + tileFitTolerance < 900, "a column is narrower than 900pt")
+    let onePane = layoutFrames(count: 1, vf: vf, kind: .columns, share: 0.5, gap: gap)
+    tileProtoCheck(onePane[0].width + tileFitTolerance >= 900, "one pane still holds 900pt")
     let merged = planTileFit(needs: needs, groups: [[0], [1], [2]], bound: [:]) { groups in
         layoutFrames(count: groups.count, vf: vf, kind: .columns, share: 0.5, gap: gap)
     }
-    tileProtoCheck(merged.floated.isEmpty, "a 900pt window on a 1200pt screen stacks instead of floating")
-    tileProtoCheck(merged.groups.count == 1, "stacking continues until the window fits")
-    let host = layoutFrames(count: merged.groups.count, vf: vf, kind: .columns, share: 0.5, gap: gap)
-    tileProtoCheck(host.count == 1 && host[0].width + tileFitTolerance >= 900, "the remaining cell holds 900pt")
+    tileProtoCheck(merged.floated.isEmpty, "a 900pt window on a 1200pt screen stays tiled")
+    tileProtoCheck(merged.groups.count == 3, "a wide window does not collapse the layout to one pane")
+    tileProtoCheck(merged.groups.contains { $0 == [0] }, "the wide window stays in its own pane")
 
     let boundPlan = planTileFit(needs: needs, groups: [[0], [1], [2]], bound: [1: 0]) { groups in
         layoutFrames(count: groups.count, vf: vf, kind: .columns, share: 0.5, gap: gap)
     }
-    let together = boundPlan.groups.contains { $0.contains(0) && $0.contains(1) }
-    tileProtoCheck(together && boundPlan.floated.isEmpty, "a manual stack moves with its root")
+    tileProtoCheck(boundPlan.groups.count == 3 && boundPlan.floated.isEmpty, "a manual stack does not erase panes to stay together")
 
     let huge = planTileFit(needs: [CGSize(width: 1300, height: 400)], groups: [[0]], bound: [:]) { groups in
         layoutFrames(count: groups.count, vf: vf, kind: .columns, share: 0.5, gap: gap)
     }
     tileProtoCheck(huge.floated == [0] && huge.groups.isEmpty, "wider than the screen floats and leaves the tiling")
+
+    let mixedHuge = planTileFit(
+        needs: [CGSize(width: 1300, height: 400), CGSize(width: 200, height: 200), CGSize(width: 200, height: 200)],
+        groups: [[0], [1], [2]],
+        bound: [:]
+    ) { groups in
+        layoutFrames(count: groups.count, vf: vf, kind: .columns, share: 0.5, gap: gap)
+    }
+    tileProtoCheck(mixedHuge.floated == [0], "one oversized window floats out of a multi-pane layout")
+    tileProtoCheck(mixedHuge.groups.count == 2, "the panes that still fit stay on screen")
 
     let already = planTileFit(
         needs: [CGSize(width: 200, height: 200), CGSize(width: 200, height: 200), CGSize(width: 200, height: 200)],
@@ -6246,17 +6354,54 @@ private func runTileProtoSelfTest() {
     }
     tileProtoCheck(already.groups.count == 3 && already.floated.isEmpty, "windows that fit stay in their own cells")
 
-    let sideNeeds = [
+    let sidePreview = layoutFrames(count: 3, vf: vf, kind: .side, share: 0.5, gap: gap)
+    tileProtoCheck(sidePreview[1].height + tileFitTolerance < 500, "side small cell is shorter than the tall window")
+    tileProtoCheck(sidePreview[0].height + tileFitTolerance >= 500, "side primary holds the tall window")
+    // 高窗独自占着一小格时，搬去大格会少掉一格。布局保持三格，高窗留在原格。
+    let sideAlone = planTileFit(
+        needs: [
+            CGSize(width: 400, height: 500),
+            CGSize(width: 200, height: 200),
+            CGSize(width: 200, height: 200),
+        ],
+        groups: [[1], [0], [2]],
+        bound: [:]
+    ) { groups in
+        layoutFrames(count: groups.count, vf: vf, kind: .side, share: 0.5, gap: gap)
+    }
+    tileProtoCheck(sideAlone.groups.count == 3 && sideAlone.floated.isEmpty, "a lone tall window does not erase its pane")
+    tileProtoCheck(sideAlone.groups.contains { $0 == [0] }, "the lone tall window stays where it was")
+    // 小格里还有别的窗口时，高窗可以进大格，小格留下那一扇，格数不变。
+    let sideJoined = planTileFit(
+        needs: [
+            CGSize(width: 400, height: 500),
+            CGSize(width: 200, height: 200),
+            CGSize(width: 200, height: 200),
+            CGSize(width: 200, height: 200),
+        ],
+        groups: [[1], [0, 3], [2]],
+        bound: [:]
+    ) { groups in
+        layoutFrames(count: groups.count, vf: vf, kind: .side, share: 0.5, gap: gap)
+    }
+    let joinedPrimary = sideJoined.groups.contains { $0.contains(0) && $0.contains(1) }
+    let keptSource = sideJoined.groups.contains { $0.contains(3) && !$0.contains(0) }
+    let keptNeighbor = sideJoined.groups.contains { $0.contains(2) && !$0.contains(0) }
+    tileProtoCheck(sideJoined.groups.count == 3 && sideJoined.floated.isEmpty && joinedPrimary && keptSource && keptNeighbor, "a tall window joins the large cell and leaves the other panes")
+
+    let manualNeeds = [
         CGSize(width: 400, height: 500),
         CGSize(width: 200, height: 200),
         CGSize(width: 200, height: 200),
+        CGSize(width: 200, height: 200),
+        CGSize(width: 200, height: 200),
     ]
-    let sidePlan = planTileFit(needs: sideNeeds, groups: [[1], [0], [2]], bound: [:]) { groups in
+    let manualPlan = planTileFit(needs: manualNeeds, groups: [[2], [0, 1, 3], [4]], bound: [1: 0]) { groups in
         layoutFrames(count: groups.count, vf: vf, kind: .side, share: 0.5, gap: gap)
     }
-    let joinedPrimary = sidePlan.groups.contains { $0.contains(0) && $0.contains(1) }
-    let keptNeighbor = sidePlan.groups.contains { $0.contains(2) && !$0.contains(0) }
-    tileProtoCheck(sidePlan.floated.isEmpty && joinedPrimary && keptNeighbor, "a tall window joins the large cell and leaves the other cell")
+    let movedTogether = manualPlan.groups.contains { $0.contains(0) && $0.contains(1) && $0.contains(2) }
+    let leftSpare = manualPlan.groups.contains { $0.contains(3) && !$0.contains(0) }
+    tileProtoCheck(manualPlan.groups.count == 3 && manualPlan.floated.isEmpty && movedTogether && leftSpare, "a manual stack follows its root into a cell that fits")
 
     let mac = CGRect(x: 0, y: 78, width: 1440, height: 798)
     let macGap: CGFloat = 8
@@ -6274,6 +6419,87 @@ private func runTileProtoSelfTest() {
     tileProtoCheck(effectiveTileLimit(4, kind: .grid, vf: mac, gap: macGap) == 4, "grid keeps 4")
     tileProtoCheck(effectiveTileLimit(4, kind: .rows, vf: mac, gap: macGap) == 2, "rows limit clamps to 2")
     tileProtoCheck(effectiveTileLimit(4, kind: .side, vf: mac, gap: macGap) == 3, "side limit clamps to 3")
+    tileProtoCheck(defaultTileLimit == 4, "default tile limit is 4")
+    tileProtoCheck(visiblePaneTarget(.grid, vf: mac, gap: macGap) == 4, "grid shows 4 panes on a macbook")
+    tileProtoCheck(visiblePaneTarget(.columns, vf: mac, gap: macGap) == 3, "columns show 3 panes on a macbook")
+    tileProtoCheck(visiblePaneTarget(.rows, vf: mac, gap: macGap) == 2, "rows show 2 panes on a macbook")
+    tileProtoCheck(visiblePaneTarget(.side, vf: mac, gap: macGap) == 3, "side shows 3 panes on a macbook")
+    tileProtoCheck(tileLimitForFamilyChange(saved: 3, kind: .grid, vf: mac, gap: macGap) == 4, "picking grid raises a saved limit of 3")
+    tileProtoCheck(tileLimitForFamilyChange(saved: 3, kind: .side, vf: mac, gap: macGap) == 3, "picking side keeps a saved limit of 3")
+    tileProtoCheck(tileLimitForFamilyChange(saved: 4, kind: .rows, vf: mac, gap: macGap) == 4, "picking rows does not lower a saved limit of 4")
+    tileProtoCheck(tileLimitForFamilyChange(saved: 1, kind: .columns, vf: mac, gap: macGap) == 3, "picking columns raises a one-pane layout to 3")
+    tileProtoCheck(effectiveTileLimit(tileLimitForFamilyChange(saved: 4, kind: .rows, vf: mac, gap: macGap), kind: .rows, vf: mac, gap: macGap) == 2, "saved 4 still draws 2 rows on a macbook")
+
+    var spreadCounts = [0, 0, 0]
+    for ordinal in 0..<17 {
+        spreadCounts[overflowTileIndex(windowOrdinal: ordinal, tileCount: 3)] += 1
+    }
+    tileProtoCheck(spreadCounts == [6, 6, 5], "17 windows spread across 3 panes")
+    tileProtoCheck(overflowTileIndex(windowOrdinal: 0, tileCount: 3) == 0, "the first window opens pane 0")
+    tileProtoCheck(overflowTileIndex(windowOrdinal: -4, tileCount: 3) == 0, "a negative ordinal stays in pane 0")
+    tileProtoCheck(overflowTileIndex(windowOrdinal: 4, tileCount: 0) == 0, "zero panes does not divide by zero")
+
+    func spread(_ total: Int, panes: Int) -> [[Int]] {
+        var grouped = Array(repeating: [Int](), count: panes)
+        for ordinal in 0..<total {
+            grouped[overflowTileIndex(windowOrdinal: ordinal, tileCount: panes)].append(ordinal)
+        }
+        return grouped
+    }
+    let busyNeeds = (0..<17).map { _ in CGSize(width: 280, height: 180) }
+    for kind in [LayoutKind.grid, .columns, .rows, .side] {
+        let panes = effectiveTileLimit(defaultTileLimit, kind: kind, vf: mac, gap: macGap)
+        let plan = planTileFit(needs: busyNeeds, groups: spread(17, panes: panes), bound: [:]) { groups in
+            layoutFrames(count: groups.count, vf: mac, kind: kind, share: 0.5, gap: macGap)
+        }
+        let name = layoutFamilyName(kind)
+        tileProtoCheck(plan.groups.count == panes, "busy \(name) keeps \(panes) panes")
+        tileProtoCheck(plan.floated.isEmpty, "busy \(name) keeps normal windows tiled")
+        let counts = plan.groups.map { $0.count }
+        let low = counts.min() ?? 0
+        let high = counts.max() ?? 0
+        tileProtoCheck(high - low <= 1, "busy \(name) stacks differ by at most one window")
+    }
+    let wideNeeds = (0..<9).map { _ in CGSize(width: 800, height: 220) }
+    let wideColumns = planTileFit(needs: wideNeeds, groups: spread(9, panes: 3), bound: [:]) { groups in
+        layoutFrames(count: groups.count, vf: mac, kind: .columns, share: 0.5, gap: macGap)
+    }
+    tileProtoCheck(wideColumns.groups.count == 3 && wideColumns.floated.isEmpty, "800pt windows stay in three columns")
+    let wideGrid = planTileFit(needs: wideNeeds, groups: spread(9, panes: 4), bound: [:]) { groups in
+        layoutFrames(count: groups.count, vf: mac, kind: .grid, share: 0.5, gap: macGap)
+    }
+    tileProtoCheck(wideGrid.groups.count == 4 && wideGrid.floated.isEmpty, "800pt windows do not collapse a grid of four")
+
+    func familySignature(_ kind: LayoutKind) -> String {
+        let panes = effectiveTileLimit(defaultTileLimit, kind: kind, vf: mac, gap: macGap)
+        return layoutFrames(count: panes, vf: mac, kind: kind, share: 0.5, gap: macGap).map { frame in
+            "\(Int(frame.minX.rounded())),\(Int(frame.minY.rounded())),\(Int(frame.width.rounded())),\(Int(frame.height.rounded()))"
+        }.joined(separator: "|")
+    }
+    var familyShapes: Set<String> = []
+    for kind in [LayoutKind.grid, .columns, .rows, .side] {
+        let panes = effectiveTileLimit(defaultTileLimit, kind: kind, vf: mac, gap: macGap)
+        tileProtoCheck(panes > 1, "\(layoutFamilyName(kind)) is not one full-screen pane")
+        let shape = familySignature(kind)
+        tileProtoCheck(!familyShapes.contains(shape), "\(layoutFamilyName(kind)) geometry differs from the other families")
+        familyShapes.insert(shape)
+    }
+    let macGrid3 = layoutFrames(count: 3, vf: mac, kind: .grid, share: 0.5, gap: macGap)
+    let macSide3 = layoutFrames(count: 3, vf: mac, kind: .side, share: 0.5, gap: macGap)
+    tileProtoCheck(macGrid3 == macSide3, "grid 3 and side 3 share one shape")
+    let macGrid4 = layoutFrames(count: 4, vf: mac, kind: .grid, share: 0.5, gap: macGap)
+    tileProtoCheck(macGrid4 != macSide3, "grid 4 is not the side shape")
+    var walkLimit = 3
+    var walkShapes: [String] = []
+    for kind in [LayoutKind.columns, .grid, .rows, .side] {
+        walkLimit = tileLimitForFamilyChange(saved: walkLimit, kind: kind, vf: mac, gap: macGap)
+        let panes = effectiveTileLimit(walkLimit, kind: kind, vf: mac, gap: macGap)
+        let shape = layoutFrames(count: panes, vf: mac, kind: kind, share: 0.5, gap: macGap).map { frame in
+            "\(Int(frame.minX.rounded())),\(Int(frame.minY.rounded())),\(Int(frame.width.rounded())),\(Int(frame.height.rounded()))"
+        }.joined(separator: "|")
+        walkShapes.append(shape)
+    }
+    tileProtoCheck(Set(walkShapes).count == 4, "columns, grid, rows, and side stay different after a saved limit of 3")
 
     let wideScreen = CGRect(x: 0, y: 0, width: 1728, height: 1015)
     tileProtoCheck(layoutCountFits(4, kind: .columns, vf: wideScreen, gap: macGap), "wider screen unlocks four columns")
