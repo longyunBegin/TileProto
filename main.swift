@@ -434,6 +434,33 @@ func minimapLayout(work: CGRect, frames: [CGRect], canvas: CGRect) -> [CGRect] {
     }
 }
 
+/// 实际帧探出自己的格子，并且探到了另一格的矩形里。同一格里的堆叠不算。
+func frameCrossesPane(_ actual: CGRect, cell: CGRect, neighbor: CGRect, tolerance: CGFloat = tileFitTolerance) -> Bool {
+    let over = max(cell.minX - actual.minX, cell.minY - actual.minY,
+                   actual.maxX - cell.maxX, actual.maxY - cell.maxY)
+    guard over > tolerance else { return false }
+    let inter = actual.intersection(neighbor)
+    if inter.isNull { return false }
+    return inter.width > 1 && inter.height > 1
+}
+
+/// 这扇窗装不进分给它的格子：已知最小尺寸过大，或者实际帧已经探出格子。
+func windowIsSeamOffender(minSize: CGSize, cell: CGRect, actual: CGRect, tolerance: CGFloat = tileFitTolerance) -> Bool {
+    if slotShortfall(minSize, cell, tolerance: tolerance) > 0 { return true }
+    let over = max(cell.minX - actual.minX, cell.minY - actual.minY,
+                   actual.maxX - cell.maxX, actual.maxY - cell.maxY)
+    return over > tolerance
+}
+
+/// 两格的窗口叠在一起时，只有两边都装得下自己的格子才收回整条缝。
+/// 任何一边是装不下的窗口，缝的份额留下，只把那一扇挪走。
+func seamMustRevert(_ pairs: [(offenderA: Bool, offenderB: Bool)]) -> Bool {
+    for pair in pairs where !pair.offenderA && !pair.offenderB {
+        return true
+    }
+    return false
+}
+
 /// 放宽格数时，把要拆出来的那一扇排到现有格主之后，下一格就是它。
 /// owners 是当前每一格的根，promoted 是从最满的叠里拆出的那一扇。
 func windowOrderPromoting(_ order: [String], owners: [String], promoted: String) -> [String] {
@@ -3008,9 +3035,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 已经跨到另一块屏的不弹回，交给集合变化后在新屏重排。
         if NSEvent.pressedMouseButtons == 0, draggingDividerID == nil, dragState == nil, pendingDrag == nil {
             var toasted = false
+            var floatedCover = false
             for (sid, tiles) in lastTilesByScreen {
                 let live = tickWindows.filter { screenID(screenForFrame($0.frame)) == sid }
-                for t in tiles {
+                for (tileIndex, t) in tiles.enumerated() {
                     let key = winKey(t.top)
                     guard key != focusKey else { continue }
                     guard frameMotions[key] == nil else { continue }
@@ -3054,82 +3082,46 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     }
                     // 位置已回落：清除卡住记录，下一轮偏离可正常弹回。
                     snapStuck.removeValue(forKey: key)
-                    // 成员级 overflow 兜底：非格顶成员超宽残留上面两道网都抓不到——
-                    // 位置弹回只认位置偏离（位置对、只宽错就看不见），格顶 overflow 只查格顶。
-                    // 任一成员实际帧超出本格且与另一格真相交，就放回本格帧（位置+尺寸）。
-                    // 只修“超出且盖住邻居”的：比格窄的最小尺寸顶住是合法的，绝不碰；
-                    // 卡住抑制与格顶同一口径（同窗同帧 ±1.5pt 不再重试、不记日志）。
-                    // 插在这里而不是格顶 overflow 之后：格顶那几道 guard … continue 会跳过
-                    // 其后的循环，放前面才能每 tick 都跑到（位置弹回那 tick 仍 continue，下一 tick 补上）。
+                    // 探出自己的格子并盖进另一格：不再把窗口按回它装不下的矩形。
+                    // 那一次 AX 会被最小尺寸顶住，下一拍还是盖着，于是反复 size mismatch。
+                    // 格子和份额留下，只把这扇窗浮出平铺。飞行中的弹簧不判。
                     if t.stack.count > 1 {
-                        let tileFrame = t.frame
                         for m in t.stack {
                             let mk = winKey(m)
                             guard mk != key, mk != focusKey, !floatedKeys.contains(mk),
                                   frameMotions[mk] == nil,
                                   let mw = live.first(where: { winKey($0) == mk }) else { continue }
-                            let mFrame = mw.frame
-                            let mOver = max(tileFrame.minX - mFrame.minX, tileFrame.minY - mFrame.minY,
-                                            mFrame.maxX - tileFrame.maxX, mFrame.maxY - tileFrame.maxY)
-                            guard mOver > tileFitTolerance else {
+                            guard coversAnyOtherPane(mw.frame, cellIndex: tileIndex, tiles: tiles) else {
                                 overflowSnapStuck.removeValue(forKey: mk)
                                 continue
                             }
-                            let mHitsNeighbor = tiles.contains { other in
-                                guard other.frame != tileFrame else { return false }
-                                let inter = mFrame.intersection(other.frame)
-                                return !inter.isNull && inter.width > 1 && inter.height > 1
+                            floatOversized(mw, on: NSScreen.screens.first(where: { screenID($0) == sid }) ?? screenForFrame(mw.frame))
+                            overflowSnapStuck.removeValue(forKey: mk)
+                            floatedCover = true
+                            log("cross-pane float: \(mw.appName) was covering another pane")
+                            if !toasted {
+                                showToast("Floated out of the grid", detail: "It was covering another pane.", on: NSScreen.screens.first(where: { screenID($0) == sid }))
+                                toasted = true
                             }
-                            guard mHitsNeighbor else {
-                                overflowSnapStuck.removeValue(forKey: mk)
-                                continue
-                            }
-                            if let stuck = overflowSnapStuck[mk],
-                               abs(mFrame.minX - stuck.minX) < 1.5, abs(mFrame.minY - stuck.minY) < 1.5,
-                               abs(mFrame.maxX - stuck.maxX) < 1.5, abs(mFrame.maxY - stuck.maxY) < 1.5 {
-                                continue
-                            }
-                            overflowSnapStuck[mk] = mFrame
-                            placeFrame(mw.element, tileFrame, key: mk, animated: true)
-                            log("overflow snap: \(mw.appName) overhang=\(Int(mOver.rounded()))pt")
                         }
                     }
-                    // 原生边缘 resize 兜底：从底边/右边拉大时左上角不动，位置偏离为 0，
-                    // 上面那条弹回看不见它。只修“超出本格且确实盖住邻居格”的情况；
-                    // 小于格子的最小尺寸顶住绝不碰，否则回到每秒误判 + toast 死循环。
-                    let tile = t.frame
-                    let liveFrame = w.frame
-                    let over = max(tile.minX - liveFrame.minX, tile.minY - liveFrame.minY,
-                                   liveFrame.maxX - tile.maxX, liveFrame.maxY - tile.maxY)
-                    guard over > tileFitTolerance else {
+                    guard frameMotions[key] == nil else { continue }
+                    guard coversAnyOtherPane(w.frame, cellIndex: tileIndex, tiles: tiles) else {
                         overflowSnapStuck.removeValue(forKey: key)
                         continue
                     }
-                    let hitsNeighbor = tiles.contains { other in
-                        guard other.frame != tile else { return false }
-                        let inter = liveFrame.intersection(other.frame)
-                        return !inter.isNull && inter.width > 1 && inter.height > 1
-                    }
-                    guard hitsNeighbor else {
-                        overflowSnapStuck.removeValue(forKey: key)
-                        continue
-                    }
-                    // 防打架：还卡在同一帧就不重试、不弹 toast；帧变了或修好了才允许下一轮。
-                    if let stuck = overflowSnapStuck[key],
-                       abs(liveFrame.minX - stuck.minX) < 1.5, abs(liveFrame.minY - stuck.minY) < 1.5,
-                       abs(liveFrame.maxX - stuck.maxX) < 1.5, abs(liveFrame.maxY - stuck.maxY) < 1.5 {
-                        continue
-                    }
-                    overflowSnapStuck[key] = liveFrame
-                    placeFrame(w.element, placed, key: key, animated: true)
-                    log("overflow snap: \(w.appName) overhang=\(Int(over.rounded()))pt")
-                    let toastBlocked = suppressSnapToastUntil.map { Date() < $0 } ?? false
-                    if !toasted, !toastBlocked {
-                        let screen = NSScreen.screens.first(where: { screenID($0) == sid })
-                        showToast("Window back in its tile.", detail: "It had grown over another tile.", on: screen)
+                    floatOversized(w, on: NSScreen.screens.first(where: { screenID($0) == sid }) ?? screenForFrame(w.frame))
+                    overflowSnapStuck.removeValue(forKey: key)
+                    floatedCover = true
+                    log("cross-pane float: \(w.appName) was covering another pane")
+                    if !toasted {
+                        showToast("Floated out of the grid", detail: "It was covering another pane.", on: NSScreen.screens.first(where: { screenID($0) == sid }))
                         toasted = true
                     }
                 }
+            }
+            if floatedCover, dragState == nil, draggingDividerID == nil {
+                forceTile()
             }
         }
         // ⌘ 拖已经把窗口抬离格子。这里若重排，会把抬起的窗口拽回原格，
@@ -4063,7 +4055,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let frames = framesFor(stacks: fitStacks, screen: screen, sid: sid)
         // 整叠交换置换：frames 按未置换的叠算（每格几何固定、缝记忆按格），只换每格里装哪一叠。
-        // 整屏装不下的成员才浮动；装不进当前小格的仍写入这格。栈顶下标按计算格存，随叠走。
+        // 整屏装不下、或者装不进分到的这一格，都浮走。留在小格里会探过缝盖住邻居。
+        // 栈顶下标按计算格存，随叠走。
         let swapPerm = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: fitStacks.count)
         if swapPerm == Array(0..<fitStacks.count) { tileSwapPermByScreen.removeValue(forKey: sid) } else { tileSwapPermByScreen[sid] = swapPerm }
         let displayStacks = swapPerm.map { fitStacks[$0] }
@@ -4077,14 +4070,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for w in stack {
                 let key = winKey(w)
                 let minSize = effectiveMin(for: w)
-                if frameContained(in: workCell, proposed: workCell, minSize: minSize) == nil {
+                if frameContained(in: workCell, proposed: workCell, minSize: minSize) == nil
+                    || frameContained(in: slot, proposed: slot, minSize: minSize) == nil {
                     floatOversized(w, on: screen)
+                    log("cross-pane float: \(w.appName) does not fit pane \(i)")
                     continue
                 }
-                // 最小尺寸比这格大时，弹簧仍落到这格。传 .zero 是因为 frameContained 对过大的最小值会直接拒绝，动画会跳过中间帧。
-                let motionMin = frameContained(in: slot, proposed: slot, minSize: minSize) == nil ? CGSize.zero : minSize
                 let preSize = getSize(w.element)
-                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: motionMin)
+                placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: minSize)
                 lastPlacedFrames[key] = slot
                 placedStacks[i].append(w)
             }
@@ -4683,6 +4676,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    func coversAnyOtherPane(_ actual: CGRect, cellIndex: Int, tiles: [(stack: [WinInfo], frame: CGRect, top: WinInfo)]) -> Bool {
+        guard tiles.indices.contains(cellIndex) else { return false }
+        let cell = tiles[cellIndex].frame
+        for (i, other) in tiles.enumerated() where i != cellIndex {
+            if frameCrossesPane(actual, cell: cell, neighbor: other.frame) { return true }
+        }
+        return false
+    }
+
     func framesOverlap(_ frames: [CGRect]) -> Bool {
         for i in frames.indices {
             for j in frames.indices where j > i {
@@ -4775,11 +4777,70 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("divider drag cancelled: stack changed")
     }
 
+    /// 跨格重叠里，装不进自己格子的窗口。两边都装得下却仍重叠时，整条缝才收回。
+    func classifySeamOverlap(_ samples: [(tile: Int, window: WinInfo, actual: CGRect, cell: CGRect)]) -> (revert: Bool, offenders: [WinInfo]) {
+        var pairs: [(offenderA: Bool, offenderB: Bool)] = []
+        var offenders: [String: WinInfo] = [:]
+        for a in samples.indices {
+            for b in samples.indices where b > a && samples[b].tile != samples[a].tile {
+                let inter = samples[a].actual.intersection(samples[b].actual)
+                guard !inter.isNull, inter.width > 1, inter.height > 1 else { continue }
+                let aOff = windowIsSeamOffender(minSize: effectiveMin(for: samples[a].window), cell: samples[a].cell, actual: samples[a].actual)
+                let bOff = windowIsSeamOffender(minSize: effectiveMin(for: samples[b].window), cell: samples[b].cell, actual: samples[b].actual)
+                pairs.append((offenderA: aOff, offenderB: bOff))
+                if aOff { offenders[winKey(samples[a].window)] = samples[a].window }
+                if bOff { offenders[winKey(samples[b].window)] = samples[b].window }
+            }
+        }
+        return (seamMustRevert(pairs), Array(offenders.values))
+    }
+
+    /// 把装不下新格子的窗口浮走，并从这一次拖缝的格子和快照里拿掉。缝的份额不动。
+    func ejectSeamOffender(_ w: WinInfo, tileIndex: Int, screen: NSScreen, sid: CGDirectDisplayID, tiles: inout [(stack: [WinInfo], frame: CGRect, top: WinInfo)]) {
+        let key = winKey(w)
+        floatOversized(w, on: screen)
+        if tiles.indices.contains(tileIndex) {
+            tiles[tileIndex].stack.removeAll { winKey($0) == key }
+            if winKey(tiles[tileIndex].top) == key, let next = tiles[tileIndex].stack.first {
+                tiles[tileIndex].top = next
+            }
+        }
+        stackedOnto.removeValue(forKey: key)
+        let fallback = tiles.indices.contains(tileIndex) ? tiles[tileIndex].stack.first.map { winKey($0) } : nil
+        let children = stackedOnto.filter { $0.value == key }.map { $0.key }
+        for child in children {
+            if let fallback, child != fallback {
+                stackedOnto[child] = fallback
+            } else {
+                stackedOnto.removeValue(forKey: child)
+            }
+        }
+        if let snap = dividerDragSnapshot, snap.sid == sid {
+            var keys = snap.memberKeys
+            keys.remove(key)
+            var frames = snap.memberFrames
+            frames.removeValue(forKey: key)
+            let snapTiles = snap.tiles.map { item -> (keys: Set<String>, frame: CGRect) in
+                var next = item.keys
+                next.remove(key)
+                return (keys: next, frame: item.frame)
+            }
+            dividerDragSnapshot = DividerDragSnapshot(
+                sid: snap.sid, dividerID: snap.dividerID, vertical: snap.vertical, seamCenter: snap.seamCenter,
+                tiles: snapTiles, memberKeys: keys, memberFrames: frames,
+                splitOverrideKey: snap.splitOverrideKey, splitOverrideValue: snap.splitOverrideValue,
+                snapLo: snap.snapLo, snapHi: snap.snapHi)
+        }
+        lastTilesByScreen[sid] = tiles
+        log("seam float: \(w.appName) does not fit the resized pane")
+    }
+
     // 松手结算：两侧两格全部成员按最终帧摆一次，再读实际帧复核。
     // 返回 true 表示落定（调用方记 split dragged），false 表示整步撤销或取消。
+    // 装不下新格子的窗口浮走，不把用户拖过的份额收回。
     func settleDividerDrag(screen: NSScreen, dividerID: String, vertical: Bool) -> Bool {
         let sid = screenID(screen)
-        guard let tiles = lastTilesByScreen[sid], tiles.count >= 2,
+        guard var tiles = lastTilesByScreen[sid], tiles.count >= 2,
               let snap = dividerDragSnapshot, snap.sid == sid, snap.dividerID == dividerID, snap.vertical == vertical else {
             return false
         }
@@ -4826,25 +4887,18 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             setPosition(j.el, CGPoint(x: j.new.minX, y: mh - j.new.maxY))
             setSize(j.el, j.new.size)
         }
-        // 复核：读两侧两格全部成员实际帧，跨格真重叠（>1pt 双维）则整步撤销。
-        var actualList: [CGRect] = []
-        var actualOwners: [Int] = []
+        // 复核：跨格真重叠时，装不下的窗口浮走，份额留下。
+        // 只有两边都装得下自己的格子却仍重叠，才整步撤销。
+        var samples: [(tile: Int, window: WinInfo, actual: CGRect, cell: CGRect)] = []
         for i in adj {
             for w in tiles[i].stack {
                 if let actual = getFrame(w.element, screenHeight: mh) {
-                    actualList.append(actual)
-                    actualOwners.append(i)
+                    samples.append((tile: i, window: w, actual: actual, cell: tiles[i].frame))
                 }
             }
         }
-        var actualOverlap = false
-        for a in actualList.indices {
-            for b in actualList.indices where b > a && actualOwners[b] != actualOwners[a] {
-                let inter = actualList[a].intersection(actualList[b])
-                if !inter.isNull, inter.width > 1, inter.height > 1 { actualOverlap = true }
-            }
-        }
-        if actualOverlap {
+        let decision = classifySeamOverlap(samples)
+        if decision.revert {
             // 整步撤销：顶部 + 成员都送回 phase 0 快照的拖前帧，格子记录、手柄、
             // splitOverrides 一并复位（沿用每拖节流的撤销日志）。
             for j in jobs {
@@ -4889,13 +4943,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             raiseGrips()
             if !dividerRevertLogged {
-                log("divider drag reverted: actual overlap after drop, seam stays")
+                log("divider drag reverted: panes that both fit still overlapped, seam stays")
                 dividerRevertLogged = true
             }
             return false
         }
-        // 落定：写全部成员落点，跑虚高遗忘（只忘不学，沿用现有规则与守卫）。
-        for j in jobs { lastPlacedFrames[j.key] = j.new }
+        let ejected = Set(decision.offenders.map { winKey($0) })
+        for w in decision.offenders {
+            let owner = samples.first { winKey($0.window) == winKey(w) }?.tile ?? adj.first ?? 0
+            ejectSeamOffender(w, tileIndex: owner, screen: screen, sid: sid, tiles: &tiles)
+        }
+        lastTilesByScreen[sid] = tiles
+        // 落定：写还在格子里的成员落点。浮走的窗口落点由 floatOversized 记下。
+        for j in jobs where !ejected.contains(j.key) { lastPlacedFrames[j.key] = j.new }
         forgetInflatedMinsForDividerDrop(screen: screen, dividerID: dividerID, vertical: vertical)
         return true
     }
@@ -4906,7 +4966,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vf = screen.visibleFrame
         let oldFrames = tiles.map { $0.frame }
         let g = gapForLayout()
-        let half = g / 2
         guard let d = deriveDividers(frames: oldFrames, gap: g, sid: sid).first(where: { $0.id == dividerID && $0.vertical == vertical }) else { return }
         // 成员集合变了（窗口增减）：取消本次拖动，不清已摆的顶部，tick 重排接管。
         let adj = dividerAdjacentIndices(tiles: tiles, divider: d, gap: g)
@@ -4918,44 +4977,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return
             }
         }
-        // 墙用最小尺寸证据顶，不摆完再撤销：
-        // ① deriveDividers 的几何界（160/120 绝对下限）；
-        // ② 快照实际帧顶回：拖动中成员不动，已超宽成员的拖前实际帧是一堵固定的墙，
-        //    phase 0 算好，不必每步重读；
-        // ③ effectiveMin 层：两侧两格各成员的 effectiveMin（AX 最小值与已学值取大）
-        //    取 max 作该格最小宽——音乐 980 这类真最小宽就顶在这里，而不是事后撤销。
-        //    每步每成员 1 次 AX 读值（只读最小尺寸属性，不摆窗）。
-        var lo = d.minCenter
-        var hi = d.maxCenter
-        if let snap = dividerDragSnapshot, snap.sid == sid, snap.dividerID == dividerID, snap.vertical == vertical {
-            if let v = snap.snapLo { lo = max(lo, v) }
-            if let v = snap.snapHi { hi = min(hi, v) }
-        }
-        for i in adj {
-            let t = tiles[i]
-            var maxMin: CGFloat = 0
-            for w in t.stack {
-                let m = effectiveMin(for: w)
-                let v = vertical ? m.width : m.height
-                if v > maxMin { maxMin = v }
-            }
-            guard maxMin > 1 else { continue }
-            if vertical {
-                if abs(t.frame.maxX - (d.center - half)) < 1.5 {
-                    lo = max(lo, t.frame.minX + maxMin + half)
-                } else if abs(t.frame.minX - (d.center + half)) < 1.5 {
-                    hi = min(hi, t.frame.maxX - maxMin - half)
-                }
-            } else {
-                if abs(t.frame.minY - (d.center + half)) < 1.5 {
-                    hi = min(hi, t.frame.maxY - maxMin - half)
-                } else if abs(t.frame.maxY - (d.center - half)) < 1.5 {
-                    lo = max(lo, t.frame.minY + maxMin + half)
-                }
-            }
-        }
-        // 两侧下限打架时停在原缝。min(max(value, lo), hi) 在 lo>hi 时会落到 hi，把另一侧盖住。
-        let clamped: CGFloat = lo <= hi ? min(max(proposed, lo), hi) : d.center
+        // 缝只受几何下限约束（每侧大约 160×120）。某扇窗自己的最小尺寸不是墙：
+        // 它装不下新格子就在落点浮走，不能把整条缝钉死，也不能在松手时把份额收回。
+        // 两侧几何下限打架（格子已经小于 160/120）时停在原缝，避免 min/max 交叉后盖住另一侧。
+        let clamped: CGFloat = d.minCenter <= d.maxCenter
+            ? min(max(proposed, d.minCenter), d.maxCenter)
+            : d.center
         var newFrames = oldFrames
         for i in oldFrames.indices {
             let o = oldFrames[i]
@@ -4993,6 +5020,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let newF = newFrames[i]
             for w in tiles[i].stack { frameMotions.removeValue(forKey: winKey(w)) }
             tiles[i].frame = newF
+            guard !tiles[i].stack.isEmpty else { continue }
             let top = tiles[i].top
             let key = winKey(top)
             let old = lastPlacedFrames[key] ?? oldFrames[i]
@@ -5010,28 +5038,16 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             setPosition(j.el, CGPoint(x: j.new.minX, y: mh - j.new.maxY))
             setSize(j.el, j.new.size)
         }
-        // 每步复核只针对两扇顶部：意图帧干净不代表实际帧干净——AX 会把窗口按真实
-        // 最小尺寸顶住（变大、位置已移到新格），意图帧的 framesOverlap 拦不住。
-        // 成员拖动中没动，不可能新重叠，读它们是纯浪费。两扇顶部确实重叠
-        // （交集宽高均 >1pt，与 framesOverlap 同口径）则撤销这一步，不把重叠存下来。
-        // 注意：此处 lastPlacedFrames 与 splitOverrides 尚未写入本步新值，
-        // 撤销只需把顶部 AX 落点与面板送回上一步，不用恢复这两处记录。
-        var actualList: [CGRect] = []
-        var actualOwners: [Int] = []
-        for i in adj {
+        // 顶部实际帧跨格重叠时：装不下的浮走，份额照记。
+        // 两边都装得下却仍重叠，才把这一步退回，不把坏的重叠存下来。
+        var samples: [(tile: Int, window: WinInfo, actual: CGRect, cell: CGRect)] = []
+        for i in adj where !tiles[i].stack.isEmpty {
             if let actual = getFrame(tiles[i].top.element, screenHeight: mh) {
-                actualList.append(actual)
-                actualOwners.append(i)
+                samples.append((tile: i, window: tiles[i].top, actual: actual, cell: newFrames[i]))
             }
         }
-        var actualOverlap = false
-        for a in actualList.indices {
-            for b in actualList.indices where b > a && actualOwners[b] != actualOwners[a] {
-                let inter = actualList[a].intersection(actualList[b])
-                if !inter.isNull, inter.width > 1, inter.height > 1 { actualOverlap = true }
-            }
-        }
-        if actualOverlap {
+        let decision = classifySeamOverlap(samples)
+        if decision.revert {
             for j in jobs {
                 let shrinkingBack = j.old.width <= j.new.width + 0.5 && j.old.height <= j.new.height + 0.5
                 if shrinkingBack {
@@ -5062,15 +5078,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
             raiseGrips()
-            // 同一拖动会话里只记一次：顶住真最小尺寸持续拖动时，每步都会撤销，日志会刷屏。
+            // 同一拖动会话里只记一次，避免两边都装得下却仍重叠时每步刷屏。
             if !dividerRevertLogged {
-                log("divider drag reverted: actual overlap after drop, seam stays")
+                log("divider drag reverted: panes that both fit still overlapped, seam stays")
                 dividerRevertLogged = true
             }
             return
         }
-        // 成功一步只写两扇顶部的落点；成员的落点与虚高遗忘留到松手结算时一次做。
-        for j in jobs { lastPlacedFrames[j.key] = j.new }
+        let ejected = Set(decision.offenders.map { winKey($0) })
+        for w in decision.offenders {
+            let owner = samples.first { winKey($0.window) == winKey(w) }?.tile ?? 0
+            ejectSeamOffender(w, tileIndex: owner, screen: screen, sid: sid, tiles: &tiles)
+        }
+        // 成功一步只写还在格子里的顶部；装不下的已经浮走。成员留到松手结算。
+        for j in jobs where !ejected.contains(j.key) { lastPlacedFrames[j.key] = j.new }
         lastTilesByScreen[sid] = tiles
         if screenID(activeScreen()) == sid { lastTiles = tiles }
         let frac = vertical
@@ -7642,6 +7663,23 @@ private func runTileProtoSelfTest() {
     tileProtoCheck(minimapLayout(work: .zero, frames: mapCols, canvas: mapCanvas).isEmpty, "minimap rejects an empty work area")
     let promotedOrder = windowOrderPromoting(["a", "b", "c", "d", "e"], owners: ["a", "b", "c"], promoted: "e")
     tileProtoCheck(promotedOrder == ["a", "b", "c", "e", "d"], "a wider limit gives the buried window the new pane")
+
+    let cell = CGRect(x: 0, y: 0, width: 400, height: 300)
+    let neighbor = CGRect(x: 408, y: 0, width: 400, height: 300)
+    let inside = CGRect(x: 0, y: 0, width: 400, height: 300)
+    let spilling = CGRect(x: 0, y: 0, width: 500, height: 300)
+    tileProtoCheck(!frameCrossesPane(inside, cell: cell, neighbor: neighbor), "a window inside its pane does not cross the seam")
+    tileProtoCheck(frameCrossesPane(spilling, cell: cell, neighbor: neighbor), "a window wider than its pane crosses into the neighbor")
+    tileProtoCheck(!frameCrossesPane(CGRect(x: 0, y: 0, width: 404, height: 300), cell: cell, neighbor: neighbor), "four points of overhang stays inside the tolerance")
+    tileProtoCheck(!frameCrossesPane(CGRect(x: 0, y: 0, width: 406, height: 300), cell: cell, neighbor: neighbor), "overhang that stops in the gap does not count as covering the next pane")
+    tileProtoCheck(windowIsSeamOffender(minSize: CGSize(width: 900, height: 200), cell: cell, actual: inside), "a minimum wider than the pane is an offender")
+    tileProtoCheck(windowIsSeamOffender(minSize: .zero, cell: cell, actual: spilling), "an actual frame past the pane is an offender")
+    tileProtoCheck(!windowIsSeamOffender(minSize: CGSize(width: 200, height: 200), cell: cell, actual: inside), "a window that fits is not an offender")
+    tileProtoCheck(!seamMustRevert([]), "no overlap does not revert the seam")
+    tileProtoCheck(!seamMustRevert([(offenderA: true, offenderB: false)]), "one offender does not revert the seam")
+    tileProtoCheck(!seamMustRevert([(offenderA: true, offenderB: true)]), "two offenders do not revert the seam")
+    tileProtoCheck(seamMustRevert([(offenderA: false, offenderB: false)]), "two windows that both fit still revert the seam")
+    tileProtoCheck(seamMustRevert([(offenderA: true, offenderB: false), (offenderA: false, offenderB: false)]), "one clean pair is enough to revert the seam")
     let tall = CGRect(x: 0, y: 0, width: 1440, height: 1200)
     tileProtoCheck(layoutCountFits(3, kind: .rows, vf: tall, gap: macGap), "taller screen unlocks three rows")
     tileProtoCheck(layoutCountFits(4, kind: .side, vf: tall, gap: macGap), "taller screen unlocks side 4")
