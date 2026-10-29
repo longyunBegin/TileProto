@@ -1416,9 +1416,43 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 菜单栏面板
 
+    // 菜单栏图标：与应用图标同款的一大两小磁贴，程序化绘制的模板图（无深色底）。
+    // isTemplate = true，系统按浅色/深色菜单栏自动反白。未授权时右上角加感叹号
+    // 徽标：实心圆 + 透明 ! 镂空（模板图只认 alpha，红点在模板模式下不会显红，
+    // 故不用红点），授权恢复后回到干净模板图。
+    func menuBarIcon(untrusted: Bool) -> NSImage {
+        let s: CGFloat = 18
+        let img = NSImage(size: NSSize(width: s, height: s))
+        img.lockFocus()
+        NSColor.black.setFill()
+        let m: CGFloat = 1, g: CGFloat = 2
+        let bigW = (s - m * 2 - g) * 0.56
+        let smallX = m + bigW + g
+        let smallW = s - m - smallX
+        let smallH = (s - m * 2 - g) / 2
+        func tile(_ r: NSRect) {
+            NSBezierPath(roundedRect: r, xRadius: 1.5, yRadius: 1.5).fill()
+        }
+        tile(NSRect(x: m, y: m, width: bigW, height: s - m * 2))
+        tile(NSRect(x: smallX, y: m + smallH + g, width: smallW, height: smallH))
+        tile(NSRect(x: smallX, y: m, width: smallW, height: smallH))
+        if untrusted {
+            // 右上角徽标：直径 8 的实心圆，圆内用 destinationOut 镂出 !（竖条 + 圆点）
+            NSBezierPath(ovalIn: NSRect(x: s - 8, y: s - 8, width: 8, height: 8)).fill()
+            NSGraphicsContext.current?.compositingOperation = .destinationOut
+            NSBezierPath(roundedRect: NSRect(x: s - 4.75, y: s - 5, width: 1.5, height: 3.5), xRadius: 0.75, yRadius: 0.75).fill()
+            NSBezierPath(ovalIn: NSRect(x: s - 4.75, y: s - 7, width: 1.5, height: 1.5)).fill()
+            NSGraphicsContext.current?.compositingOperation = .sourceOver
+        }
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
+    }
+
     func setupPanelUI() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "▦"
+        statusItem.button?.title = ""
+        statusItem.button?.image = menuBarIcon(untrusted: false)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel(_:))
         buildPanelContent()
@@ -3152,7 +3186,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let trusted = AXIsProcessTrusted()
         if trusted != lastTrustState {
             lastTrustState = trusted
-            statusItem.button?.title = trusted ? "▦" : "▦!"
+            statusItem.button?.image = menuBarIcon(untrusted: !trusted)
             log(trusted ? "Accessibility trusted: true"
                 : "NOT TRUSTED: tiling disabled, re-grant in System Settings > Privacy & Security > Accessibility")
             if trusted {
