@@ -13,7 +13,7 @@ import QuartzCore
 //     不为了最小尺寸把整屏并成一格。整屏都装不下的那一扇才居中浮动。
 //     写入 AX 的帧是该格的矩形，不会超出该格。
 //  3. 窗口多于格子时按顺序分进每一格，每格一叠。橙色握把点按轮换；悬停条上层是芯片，
-//     下层是 Primary / Focus / Float。界面不放键帽。
+//     下层是 Primary / Focus / Float / Pin。界面不放键帽。
 //     Option+Command 拖到某格子上时，即使刚好满格也并进去，空出的格子收掉。
 //     Control+Command 仍是交换，不是进叠。
 //  4. Command 拖到另一格子：被拖窗口抬起跟手，目标格子略向内收，松手后两边滑到最终帧。
@@ -1037,21 +1037,27 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var lastPanelHeight: CGFloat = 0
     // v6 状态：悬停条 / 分隔线 / Float / Primary / 自定义分割
     var floatedKeys: Set<String> = []          // 单窗口 Float：pid|标题
-    // accordion 折叠窄条（瞬时，不持久化，重启解除）：
+    // 折叠到 Dock（瞬时，不持久化，重启解除）：
     // foldedKeys = 已折叠窗口键；折叠窗保留在原格堆叠成员身份（翻堆顺序不动），
-    // 只是不摆位、真窗口最小化隐藏、格内以窄条呈现；格顶取第一个未折叠成员。
+    // 只是不摆位、真窗口最小化隐藏；格顶取第一个未折叠成员。
     // 折叠态按 AX 键追踪：最小化窗不在 CG 在屏列表里，但仍在 AX 窗口列表里，
     // 采集放行 + 裁剪宽口径（.optionAll）都按它存在处理，不依赖 CG 在屏出现。
+    // 窄条已撤（2026-10-29 用户批准）：折叠窗不再有任何面板呈现，恢复走 Dock +
+    // 焦点取消折叠；手风琴展开（展开一个、其余全折）已随条一并撤掉。
     var foldedKeys: Set<String> = []
     var foldedScreenByKey: [String: CGDirectDisplayID] = [:]  // 折叠时记录的原属屏（最小化后 AX 帧不可靠，tileAll 据此归位）
     var foldedMinimizedKeys: Set<String> = []    // 已验证最小化的折叠窗（避免每轮重复 AX 写）
-    var foldedElements: [String: AXUIElement] = [:]  // 折叠窗的 AX 元素（收起/解除时据此取消最小化）
-    var accordionKey: String? = nil           // 手风琴展开窗（独占工作区，其余同屏窗全折）
-    var accordionScreen: CGDirectDisplayID? = nil
-    var foldStripPanels: [String: NSPanel] = [:]  // 窄条面板（键 = 窗口键）
-    var foldStripState: [String: (rect: CGRect, title: String, highlighted: Bool)] = [:]  // 窄条上次呈现（去重重建用）
-    var lastFrontmostPid: pid_t? = nil        // tick 激活检测：折叠窗 App 被前台激活时自动展开
-    var activationExpandSuppressedUntil: Date? = nil  // 点窄条展开后自带的前台激活，不再二次触发展开
+    var foldedElements: [String: AXUIElement] = [:]  // 折叠窗的 AX 元素（解除时据此取消最小化）
+    var pinnedWindowKeys: Set<String> = []  // 固定窗键（瞬时，不持久化；与拖动栈 pin 的 pinnedTops 不同）。
+    // 固定语义：豁免全部折叠门（与焦点窗同级别），摆位不动（不像 Float 居中重排），
+    // 超格就盖邻格直至取消固定；取消固定后若仍超格且非焦点，下一轮正常门折叠。
+    var frontFocusKeyForPass: String? = nil  // 本轮前台焦点窗键（焦点规则用；与 Focus 功能的 focusKey 不同）
+    var geometryChangedAt: Date = Date()  // 任一屏几何变化时刻（启动时即 Date()，首 2 秒不折叠）
+    var lastGeometrySkipLogAt: Date = .distantPast  // 几何不稳定跳过日志的节流时刻
+    var screenChangeRetileTimer: Timer? = nil  // 屏幕参数变化去抖计时器
+    var tilingInProgress: Bool = false  // tileAll 防重入
+    var tileAllPending: Bool = false  // 防重入期间又有重排请求时补跑一次
+    var lastFrontmostPid: pid_t? = nil        // tick 激活检测：折叠窗 App 被前台激活时普通恢复
     // 帧依据折叠去抖：同一窗同一格连续 2 轮 tick 安置超格才折（安定态，非动画瞬态）。
     // 键为窗口键，值为（格子标识，连续次数）；格子变了重新计；窗不在任何格里时清掉（防 pid 复用串号）。
     var frameOversizeWatch: [String: (slot: String, count: Int)] = [:]
@@ -1402,7 +1408,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 退出时也没有藏过的 App 需要放出；故这两路监听随自动独占路径一并删除。
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             log("screen parameters changed")
-            self?.forceTile()
+            self?.scheduleScreenChangeRetile()
         }
         tick()
         log("TileProto started, limit=\(tileLimit) excluded=\(excludedBundles.count)")
@@ -3123,7 +3129,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideStackMarkers()
             hideHighlights()
             removeDimLayers()
-            hideFoldStrips()
             closeStackPanel()
             // 关自动平铺：窗口保持平铺位置不动；此后新开的窗口居中浮动一次（50% 宽 × 60% 高）
             if AXIsProcessTrusted() {
@@ -3162,7 +3167,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideStackMarkers()
             hideHighlights()
             removeDimLayers()
-            hideFoldStrips()
             closeStackPanel()
             return
         }
@@ -3174,7 +3178,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideStackMarkers()
             hideHighlights()
             removeDimLayers()
-            hideFoldStrips()
             closeStackPanel()
             return
         }
@@ -3209,19 +3212,26 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("drag stack pin released")
             forceTile()
         }
-        // 手风琴：折叠窗的 App 被前台激活时视同点它的窄条，自动展开。
-        // 点窄条展开后自带的前台激活在 1.5 秒抑制期内，不二次触发；拖动中不展开。
-        // 注意：正在用的窗因格子缩小而自动折叠时不立刻再展开（避免折叠→展开→全屏的布局跳变），
-        // 点它的窄条即展开；切走再切回（前台变化）则按本条展开。
+        // 折叠窗的 App 被前台激活时普通恢复：只取消这一扇窗的最小化，不独占、
+        // 不折其他窗（手风琴展开已撤）。恢复后的窗是焦点，焦点取消折叠保护它不立刻再折。
+        // 拖动中不恢复；恢复失败则保持折叠态（仍在 Dock 里，不丢窗）。
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != lastFrontmostPid {
             lastFrontmostPid = front.processIdentifier
             if front.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-               dragState == nil, draggingDividerID == nil, NSEvent.pressedMouseButtons == 0,
-               !(activationExpandSuppressedUntil.map { Date() < $0 } ?? false) {
+               dragState == nil, draggingDividerID == nil, NSEvent.pressedMouseButtons == 0 {
                 let (target, _) = resolveCurrentTarget()
                 if let t = target, foldedKeys.contains(winKey(t)) {
-                    expandFolded(winKey(t))
+                    let key = winKey(t)
+                    if unminimizeFoldedWindow(element: t.element, key: key) {
+                        foldedKeys.remove(key)
+                        foldedMinimizedKeys.remove(key)
+                        foldedElements.removeValue(forKey: key)
+                        foldedScreenByKey.removeValue(forKey: key)
+                        log("fold restore: \(t.appName)")
+                    } else {
+                        log("fold restore skipped: cannot unminimize \(t.appName)")
+                    }
                 }
             }
         }
@@ -3231,12 +3241,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forceTile()
         }
         tickCount += 1
-        if tickCount % 5 == 0 { pruneFloated() }
+        if tickCount % 5 == 0 { pruneFloated(); prunePinned() }
         // C 批：活动磁贴跟随按屏算（用户点了别的窗口时暗色层/高亮移动，不等重排）；
         // 窗口集合没变时 tick 会在签名处提前返回，所以检查放前面
         // 收尾性能：每 tick 只枚举一次窗口再按屏分流（此前每屏各枚举一次，多屏时 N 倍浪费）
         var overlayChanged = false
         let tickWindows = collectWindows()
+        // 本轮前台焦点窗（焦点规则用）：帧门/盖邻格守卫读它，不重复枚举。
+        frontFocusKeyForPass = frontFocusKey(windows: tickWindows)
         for s in NSScreen.screens {
             let sid = screenID(s)
             let wins = tickWindows.filter { screenID(screenForFrame($0.frame)) == sid }
@@ -3275,21 +3287,44 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 帧依据自动折叠：min 门（isFoldOversize）只看记录的最小尺寸，数据低估时不触发
             // （如邮箱 1114 宽被 loader 钳制清零、AX 上报又 ≤744），此处补一档帧依据：
             // 安置后实际尺寸仍超格（任一轴超 1.5pt）即计一次，同一窗同一格连续 2 轮 tick
-            // 都超格才折。外层已排除鼠标按下/分缝/⌘拖，飞行中弹簧不计，专注/手风琴展开/
-            // 浮动/已折叠窗不计；折后下一轮摆位即最小化隐藏并显示窄条。
+            // 都超格才折。外层已排除鼠标按下/分缝/⌘拖，飞行中弹簧不计，专注/
+            // 浮动/已折叠窗不计；折后下一轮摆位即最小化隐藏到 Dock。
             do {
                 var seenFrameWatchKeys = Set<String>()
                 for (sid, tiles) in lastTilesByScreen {
                     let live = tickWindows.filter { screenID(screenForFrame($0.frame)) == sid }
-                    for t in tiles {
+                    // 名义格帧（等分基线）：帧门只判真超格，让位后的小格不触发误折。
+                    let nominalFrames: [CGRect]
+                    if let screen = NSScreen.screens.first(where: { screenID($0) == sid }) {
+                        nominalFrames = nominalTileFrames(count: tiles.count, screen: screen)
+                    } else {
+                        nominalFrames = []
+                    }
+                    for (tileIndex, t) in tiles.enumerated() {
                         for m in t.stack {
                             let mk = winKey(m)
                             seenFrameWatchKeys.insert(mk)
-                            guard mk != focusKey, mk != accordionKey, !foldedKeys.contains(mk),
+                            // 焦点规则：正在用的窗不折，且清掉帧门计数（焦点离开后重新计 2 轮，不立刻折）。
+                            if mk == frontFocusKeyForPass {
+                                frameOversizeWatch.removeValue(forKey: mk)
+                                continue
+                            }
+                            // 固定窗同豁免：固定期间不折，且清掉帧门计数（取消固定后重新计 2 轮，不立刻折）。
+                            if pinnedWindowKeys.contains(mk) {
+                                frameOversizeWatch.removeValue(forKey: mk)
+                                continue
+                            }
+                            // 几何不稳定期不计数（瞬态几何不触发连锁折叠）。
+                            if !geometryStable() {
+                                frameOversizeWatch.removeValue(forKey: mk)
+                                continue
+                            }
+                            guard mk != focusKey, !foldedKeys.contains(mk),
                                   !floatedKeys.contains(mk), frameMotions[mk] == nil,
                                   let mw = live.first(where: { winKey($0) == mk }) else { continue }
-                            let slotID = "\(sid):\(Int(t.frame.minX))x\(Int(t.frame.minY)):\(Int(t.frame.width))x\(Int(t.frame.height))"
-                            let oversize = mw.frame.width > t.frame.width + 1.5 || mw.frame.height > t.frame.height + 1.5
+                            let slotFrame = nominalFrames.indices.contains(tileIndex) ? nominalFrames[tileIndex] : t.frame
+                            let slotID = "\(sid):\(Int(slotFrame.minX))x\(Int(slotFrame.minY)):\(Int(slotFrame.width))x\(Int(slotFrame.height))"
+                            let oversize = mw.frame.width > slotFrame.width + 1.5 || mw.frame.height > slotFrame.height + 1.5
                             if !oversize {
                                 frameOversizeWatch.removeValue(forKey: mk)
                                 continue
@@ -3301,10 +3336,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             frameOversizeWatch.removeValue(forKey: mk)
                             // 先藏再记：最小化失败不进折叠集（fail-safe），旧守卫继续处理。
                             guard hideFoldedWindow(mw) else { continue }
-                            foldedKeys.insert(mk)
-                            foldedScreenByKey[mk] = sid
+                            markFolded(key: mk, sid: sid)
                             tickNeedsSolve = true
-                            log("fold (frame): \(mw.appName) frame \(Int(mw.frame.width))x\(Int(mw.frame.height)) > tile \(Int(t.frame.width))x\(Int(t.frame.height))")
+                            log("fold (frame): \(mw.appName) frame \(Int(mw.frame.width))x\(Int(mw.frame.height)) > tile \(Int(slotFrame.width))x\(Int(slotFrame.height))")
                         }
                     }
                 }
@@ -3314,9 +3348,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let live = tickWindows.filter { screenID(screenForFrame($0.frame)) == sid }
                 for (tileIndex, t) in tiles.enumerated() {
                     let key = winKey(t.top)
-                    // 手风琴展开窗与折叠窗不受弹回/盖邻格守卫摆布：展开窗独占工作区、
-                    // 折叠窗已最小化隐藏，都不是“偏离落点的格顶”。
-                    guard key != focusKey, key != accordionKey, !foldedKeys.contains(key) else { continue }
+                    // 折叠窗不受弹回/盖邻格守卫摆布：折叠窗已最小化隐藏，
+                    // 不是“偏离落点的格顶”。
+                    guard key != focusKey, !foldedKeys.contains(key) else { continue }
                     guard frameMotions[key] == nil else { continue }
                     guard let placed = lastPlacedFrames[key],
                           let w = live.first(where: { winKey($0) == key }) else { continue }
@@ -3340,7 +3374,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                             let mh = mainHeight()
                             for m in t.stack {
                                 let mk = winKey(m)
-                                guard mk != key, mk != focusKey, mk != accordionKey, !foldedKeys.contains(mk),
+                                guard mk != key, mk != focusKey, !foldedKeys.contains(mk),
                                       frameMotions[mk] == nil else { continue }
                                 setPosition(m.element, CGPoint(x: t.frame.minX, y: mh - t.frame.maxY))
                             }
@@ -3365,10 +3399,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     if t.stack.count > 1 {
                         for m in t.stack {
                             let mk = winKey(m)
-                            guard mk != key, mk != focusKey, mk != accordionKey,
+                            guard mk != key, mk != focusKey,
                                   !floatedKeys.contains(mk), !foldedKeys.contains(mk),
                                   frameMotions[mk] == nil,
                                   let mw = live.first(where: { winKey($0) == mk }) else { continue }
+                            // 焦点窗盖邻格是允许的临时态：不推回、不记成员-only、不折叠。
+                            if mk == frontFocusKeyForPass { continue }
+                            // 固定窗盖邻格同样允许：固定期间不推回、不记成员-only、不折叠。
+                            if pinnedWindowKeys.contains(mk) { continue }
                             guard coversAnyOtherPane(mw.frame, cellIndex: tileIndex, tiles: tiles) else {
                                 overflowSnapStuck.removeValue(forKey: mk)
                                 coverLoggedFrame.removeValue(forKey: mk)
@@ -3402,11 +3440,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                         tickNeedsSolve = true
                                     }
                                     // 已触发 member-only 标记视同安定超格：按回原位仍盖着即尺寸顶住，
-                                    // 立即折成窄条（不另等帧门 2 轮）；旧标记保留作 fallback。
+                                    // 立即折叠到 Dock（不另等帧门 2 轮）；旧标记保留作 fallback。
                                     // 先藏再记：最小化失败不进折叠集（fail-safe），旧守卫继续处理。
-                                    if !foldedKeys.contains(mk), hideFoldedWindow(mw) {
-                                        foldedKeys.insert(mk)
-                                        foldedScreenByKey[mk] = sid
+                                    if !foldedKeys.contains(mk), geometryStable(), hideFoldedWindow(mw) {
+                                        markFolded(key: mk, sid: sid)
                                         log("fold (cover): \(mw.appName) still covers neighbor pane")
                                     }
                                     if coverLoggedFrame[mk] == nil {
@@ -3456,6 +3493,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                        abs(w.frame.maxX - logged.maxX) < 1.5, abs(w.frame.maxY - logged.maxY) < 1.5 {
                         continue
                     }
+                    // 焦点窗盖邻格是允许的临时态：不推回、不记成员-only、不折叠
+                    // （弹回与精确性检查在前，已正常跑；只跳过盖邻格处理）。
+                    if key == frontFocusKeyForPass {
+                        overflowSnapStuck.removeValue(forKey: key)
+                        coverLoggedFrame.removeValue(forKey: key)
+                        continue
+                    }
+                    // 固定窗盖邻格同样允许：固定期间不推回、不记成员-only、不折叠。
+                    if pinnedWindowKeys.contains(key) {
+                        overflowSnapStuck.removeValue(forKey: key)
+                        coverLoggedFrame.removeValue(forKey: key)
+                        continue
+                    }
                     hardenPaneFrame(w.element, t.frame)
                     lastPlacedFrames[key] = t.frame
                     if let actual = getFrame(w.element, screenHeight: mainHeight()), !frameIsInsidePane(actual, pane: t.frame) {
@@ -3468,11 +3518,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 oversizeStacked.insert(key)
                                 tickNeedsSolve = true
                             }
-                            // 同成员守卫：已触发 member-only 标记视同安定超格，立即折成窄条。
+                            // 同成员守卫：已触发 member-only 标记视同安定超格，立即折叠到 Dock。
                             // 先藏再记：最小化失败不进折叠集（fail-safe），旧守卫继续处理。
-                            if !foldedKeys.contains(key), hideFoldedWindow(w) {
-                                foldedKeys.insert(key)
-                                foldedScreenByKey[key] = sid
+                            if !foldedKeys.contains(key), geometryStable(), hideFoldedWindow(w) {
+                                markFolded(key: key, sid: sid)
                                 log("fold (cover): \(w.appName) still covers neighbor pane")
                             }
                             if coverLoggedFrame[key] == nil {
@@ -3783,6 +3832,26 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         paneRefusals = paneRefusals.filter { isAlive($0.key) }
         if floatedKeys.count != before {
             log("floated pruned: \(before) -> \(floatedKeys.count)")
+        }
+    }
+
+    /// 固定键裁剪（仿 pruneFloated 的宽口径）：已关窗口的固定键清掉，不留死键。
+    func prunePinned() {
+        guard !pinnedWindowKeys.isEmpty, AXIsProcessTrusted() else { return }
+        let all = collectWindows(includeFloated: true, onlyCurrentSpace: false)
+        let wide = allSpaceWindowKeys()
+        var alive = Set(all.map { winKey($0) })
+        alive.formUnion(wide.keys)
+        let alivePids = wide.pids
+        func isAlive(_ key: String) -> Bool {
+            if alive.contains(key) { return true }
+            guard let bar = key.firstIndex(of: "|"), let pid = pid_t(key[key.startIndex..<bar]) else { return false }
+            return alivePids.contains(pid)
+        }
+        let before = pinnedWindowKeys.count
+        pinnedWindowKeys = pinnedWindowKeys.filter(isAlive)
+        if pinnedWindowKeys.count != before {
+            log("pinned pruned: \(before) -> \(pinnedWindowKeys.count)")
         }
     }
 
@@ -4135,6 +4204,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func tileAll(windowsByScreen: [CGDirectDisplayID: [WinInfo]]? = nil) {
         // C2：Stage Manager 暂停时连 0.5 秒补铺也不执行
         guard !stageManagerPaused else { return }
+        // 防重入：重排中又有重排请求时只记 pending，当前这轮结束后补跑一次，
+        // 避免嵌套求解互相覆盖几何与折叠状态（2026-10-29 级联防御）。
+        if tilingInProgress {
+            tileAllPending = true
+            return
+        }
+        tilingInProgress = true
+        defer {
+            tilingInProgress = false
+            if tileAllPending {
+                tileAllPending = false
+                DispatchQueue.main.async { [weak self] in self?.forceTile() }
+            }
+        }
         axMinCache.removeAll()  // 每次求解重新查 AX 最小值，缓存只活一轮
         // 约束自适应平铺没有逐窗最小化冻结：最小化窗本来就不在采集里（collectWindows 跳过），
         // 不再有“恢复时回不去原格”的冻结问题，重算永远放行。
@@ -4163,6 +4246,21 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         let allWindows = byScreen!.values.flatMap { $0 }
+        // 几何变化戳：任一屏可视区/屏帧与上一轮不同即记时刻，2 秒内折叠门全停
+        // （显示切换瞬态几何不触发连锁折叠）；比较在 tile() 覆盖旧值之前做。
+        for s in screens {
+            let sid = screenID(s)
+            if let prevVF = lastVFByScreen[sid], prevVF != s.visibleFrame {
+                geometryChangedAt = Date()
+                log("screen geometry changed: vf \(prevVF) -> \(s.visibleFrame)")
+            }
+            if let prevF = lastScreenFrameByScreen[sid], prevF != s.frame {
+                geometryChangedAt = Date()
+                log("screen geometry changed: frame \(prevF) -> \(s.frame)")
+            }
+        }
+        // 本轮前台焦点窗（焦点规则用）：tile()/demote 各折叠点读它，不重复枚举。
+        frontFocusKeyForPass = frontFocusKey(windows: allWindows)
         // 消失窗口：顺序与落点记录按全屏集合统一裁剪；Primary 全屏都不见才清
         windowOrder.removeAll { key in !allWindows.contains(where: { winKey($0) == key }) }
         lastPlacedFrames = lastPlacedFrames.filter { entry in allWindows.contains(where: { winKey($0) == entry.key }) }
@@ -4186,7 +4284,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshStackMarkers()
         refreshDimLayers()
         refreshHighlights()
-        refreshFoldStrips()
         // legacy 兜底：活动屏的磁贴/frame，供单屏路径（悬停条等）复用
         let act = activeScreen()
         lastTiles = lastTilesByScreen[screenID(act)] ?? []
@@ -4470,7 +4567,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let st = layoutSettings(for: screen)
         guard !windows.isEmpty else {
             lastTilesByScreen[sid] = []
-            if refreshOverlays { refreshGrips(); refreshDimLayers(); refreshHighlights(); refreshDotHandles(); refreshStackMarkers(); refreshFoldStrips() }
+            if refreshOverlays { refreshGrips(); refreshDimLayers(); refreshHighlights(); refreshDotHandles(); refreshStackMarkers() }
             return
         }
         let vf = screen.visibleFrame
@@ -4483,7 +4580,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 placeFrame(fw.element, full, key: fk, animated: draggingDividerID == nil)
                 lastPlacedFrames[fk] = full
                 showFocusCaption(on: screen, frame: full)
-                if refreshOverlays { hideGrips(); hideStackMarkers(); hideHighlights(); removeDimLayers(); hideFoldStrips() }
+                if refreshOverlays { hideGrips(); hideStackMarkers(); hideHighlights(); removeDimLayers() }
                 return
             }
             focusKey = nil
@@ -4500,50 +4597,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 hideStackMarkers()
                 hideHighlights()
                 removeDimLayers()
-                hideFoldStrips()
                 if cleanSpaceHole.width > 1 { showCleanDim(on: screen, hole: cleanSpaceHole) }
             }
             return
-        }
-        // 手风琴展开态：展开窗独占工作区，其余同屏窗全部折叠成窄条，不走正常求解。
-        // 展开窗自己不在折叠集里；展开期间新开的窗同样折起（手风琴持续到点展开窗窄条收起）。
-        if let ak = accordionKey, accordionScreen == sid {
-            if let ew = windows.first(where: { winKey($0) == ak }) {
-                for w in windows where winKey(w) != ak {
-                    let k = winKey(w)
-                    // 先藏再记：最小化失败的窗不进折叠集（fail-safe）；它仍可见，
-                    // 但展开窗随后抬起置顶盖住它，视觉上仍是展开窗独占。
-                    guard hideFoldedWindow(w) else { continue }
-                    if foldedKeys.insert(k).inserted { log("fold (accordion): \(w.appName)") }
-                    foldedScreenByKey[k] = sid
-                }
-                foldedKeys.remove(ak)
-                foldedMinimizedKeys.remove(ak)
-                foldedElements.removeValue(forKey: ak)
-                // foldedScreenByKey[ak] 不清：tileAll 的归位仍要用它（展开窗已在屏上时归位自然命中，
-                // 下一轮 pruneFolded 再按折叠集裁掉）。
-                AXUIElementPerformAction(ew.element, kAXRaiseAction as CFString)
-                placeFrame(ew.element, vf, key: ak, animated: draggingDividerID == nil)
-                lastPlacedFrames[ak] = vf
-                // 供悬停条/芯片等读取的单格结构：整叠都在这一格，顶是展开窗；
-                // 收起时 forceTile 重算，不依赖这里。
-                lastTilesByScreen[sid] = [(stack: windows, frame: vf, top: ew)]
-                lastPanesByScreen[sid] = [vf]
-                lastVFByScreen[sid] = vf
-                lastScreenFrameByScreen[sid] = screen.frame
-                lastActiveTileByScreen[sid] = 0
-                if refreshOverlays { refreshFoldStrips() }
-                return
-            }
-            // 展开窗已不在（关闭或被浮动排除）：解除手风琴，全部展开，落回正常求解。
-            // 先取消全部折叠窗的最小化再清键，否则窗会以最小化态丢在 Dock 里、无窄条可点。
-            unminimizeAllFoldedWindows()
-            accordionKey = nil
-            accordionScreen = nil
-            foldedKeys.removeAll()
-            foldedMinimizedKeys.removeAll()
-            foldedElements.removeAll()
-            log("accordion off: expanded window gone")
         }
         // 关掉/移走的窗口从「并进堆叠」名单里清掉，同键的新窗口要重新验算。
         // 盖邻格去抖记录同理裁剪：已关窗口的旧键若被新窗口复用，不得误去抖。
@@ -4772,21 +4828,25 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 置换清掉后计算格下标全部重排，旧 pin 会错指别的格，并格时一并清掉（重钉只需再点一次芯片）。
             pinnedTops = pinnedTops.filter { !$0.key.hasPrefix("\(sid):") }
         }
-        // Accordion 自动折叠：任一轴最小尺寸超格子的窗折成窄条（不摆位、不盖邻格）。
-        // 只在正常态算：手风琴展开态已在前面分支返回。
-        // 折叠不改变所属格与堆叠顺序，只是一个状态旗标；解除只由点窄条展开/全部收起触发，
-        // 格子尺寸变化不自动解折（避免布局一变就弹回盖邻格）。
+        // 自动折叠：任一轴最小尺寸超格子的窗折叠到 Dock（不摆位、不盖邻格）。
+        // 折叠不改变所属格与堆叠顺序，只是一个状态旗标；解除只由 Dock 恢复/
+        // 激活恢复/焦点取消折叠触发，格子尺寸变化不自动解折（避免布局一变就弹回盖邻格）。
+        // 名义格帧（等分基线）：min 门只判真超格，让位后的小格不触发误折。
+        let nominalFrames = nominalTileFrames(count: displayStacks.count, screen: screen)
         for (i, stack) in displayStacks.enumerated() {
             let slot = frames.indices.contains(i) ? frames[i] : vf
-            for w in stack where isFoldOversize(w, slot: slot) {
+            let nominalSlot = nominalFrames.indices.contains(i) ? nominalFrames[i] : slot
+            // 几何不稳定期不折（瞬态几何不触发连锁折叠）；焦点窗与固定窗不折。
+            guard geometryStable() else { continue }
+            for w in stack where winKey(w) != frontFocusKeyForPass && !pinnedWindowKeys.contains(winKey(w)) && isFoldOversize(w, slot: nominalSlot) {
                 let k = winKey(w)
                 // 先藏再记：最小化失败不进折叠集（fail-safe），仍按旧守卫处理。
                 guard hideFoldedWindow(w) else { continue }
-                if foldedKeys.insert(k).inserted {
+                if !foldedKeys.contains(k) {
+                    markFolded(key: k, sid: sid)
                     let need = effectiveMin(for: w)
-                    log("fold (oversize): \(w.appName) min \(Int(need.width))x\(Int(need.height)) > slot \(Int(slot.width))x\(Int(slot.height))")
+                    log("fold (oversize): \(w.appName) min \(Int(need.width))x\(Int(need.height)) > slot \(Int(nominalSlot.width))x\(Int(nominalSlot.height))")
                 }
-                foldedScreenByKey[k] = sid
             }
         }
         // 每格显示顶：第一个未折叠成员（从求解顶起循环找）；整格全折时回退首位（仅记账，不摆位）。
@@ -4827,18 +4887,32 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for w in stack {
                 let key = winKey(w)
                 if foldedKeys.contains(key) {
-                    // 折叠窗不摆位：真窗口最小化隐藏，格内只留窄条；仍保留在叠里（翻堆顺序不动）。
+                    // 折叠窗不摆位：真窗口最小化隐藏；仍保留在叠里（翻堆顺序不动）。
                     // 最小化失败（或被系统恢复可见后又拒绝再藏）时 fail-safe：撤出折叠集、
                     // 落到下面的普通摆位，旧守卫（demote / member-only）继续处理它；
                     // 绝不出现“以为折了、窗还看得见”。
-                    if hideFoldedWindow(w) {
+                    if key == frontFocusKeyForPass || pinnedWindowKeys.contains(key) {
+                        // 焦点/固定取消折叠：用户正在用它（Dock 恢复/激活恢复未拦截到的
+                        // 情况），或它已被固定，不再重新最小化；恢复可见后按正常摆位，
+                        // 焦点离开且未固定时再按正常门处理。
+                        if unminimizeFoldedWindow(element: w.element, key: key) {
+                            foldedKeys.remove(key)
+                            foldedMinimizedKeys.remove(key)
+                            foldedElements.removeValue(forKey: key)
+                        } else {
+                            // 恢复失败：保持折叠态，本轮不摆位（仍最小化隐藏在 Dock 里）。
+                            placedStacks[i].append(w)
+                            continue
+                        }
+                    } else if hideFoldedWindow(w) {
                         placedStacks[i].append(w)
                         continue
+                    } else {
+                        foldedKeys.remove(key)
+                        foldedMinimizedKeys.remove(key)
+                        foldedElements.removeValue(forKey: key)
+                        log("fold minimize failed: \(w.appName), unfolded for fallback")
                     }
-                    foldedKeys.remove(key)
-                    foldedMinimizedKeys.remove(key)
-                    foldedElements.removeValue(forKey: key)
-                    log("fold minimize failed: \(w.appName), unfolded for fallback")
                 }
                 // 最小尺寸再大也写入这一格。AX 若拒绝缩小，harden 会再写几次。
                 let preSize = getSize(w.element)
@@ -4873,7 +4947,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             refreshHighlights()
             refreshDotHandles()
             refreshStackMarkers()
-            refreshFoldStrips()
         }
         let tileDesc = displayStacks.enumerated().map { (i, s) in
             let names = Dictionary(grouping: s, by: { $0.appName })
@@ -4928,6 +5001,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 let top = arr[i].top
                 // 折叠顶不复核：它已最小化隐藏，帧与格子必然不匹配，复核只会误记标记。
                 guard !foldedKeys.contains(winKey(top)) else { continue }
+                // 焦点顶不复核：焦点规则——正在用的窗不 demote、不折叠，焦点离开后再正常处理。
+                // 固定顶同豁免：固定期间不 demote、不折叠，取消固定后再正常处理。
+                if winKey(top) == frontFocusKeyForPass || pinnedWindowKeys.contains(winKey(top)) { continue }
                 if let pin = pinnedTops[key] {
                     if stack.contains(where: { winKey($0) == pin }) { continue }
                     pinnedTops.removeValue(forKey: key)
@@ -4945,12 +5021,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     localChanged = true
                     logDiag("stack top demoted: \(top.appName) \(Int(actual.width))x\(Int(actual.height)) outside \(Int(panes[i].width))x\(Int(panes[i].height)), raised \(stack[alt].appName)")
                     // 已触发 demote 视同安定超格：被换下的顶不再以成员身份留在格里盖邻格，
-                    // 立即折成窄条（新标记触发异步重算）；旧 demote 逻辑不动。
+                    // 立即折叠到 Dock（新标记触发异步重算）；旧 demote 逻辑不动。
                     // 先藏再记：最小化失败不进折叠集（fail-safe），旧守卫继续处理。
                     let dtkey = winKey(top)
-                    if !foldedKeys.contains(dtkey), hideFoldedWindow(top) {
-                        foldedKeys.insert(dtkey)
-                        foldedScreenByKey[dtkey] = sid
+                    if !foldedKeys.contains(dtkey), geometryStable(), hideFoldedWindow(top) {
+                        markFolded(key: dtkey, sid: sid)
                         newMarks = true
                         log("fold (demoted): \(top.appName) demoted from its tile")
                     }
@@ -4966,11 +5041,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         oversizeHost[tkey] = stack.first(where: { winKey($0) != tkey }).map { winKey($0) } ?? ""
                         newMarks = true
                     }
-                    // 同换顶分支：已触发 member-only 标记视同安定超格，立即折成窄条。
+                    // 同换顶分支：已触发 member-only 标记视同安定超格，立即折叠到 Dock。
                     // 先藏再记：最小化失败不进折叠集（fail-safe），旧守卫继续处理。
-                    if !foldedKeys.contains(tkey), hideFoldedWindow(top) {
-                        foldedKeys.insert(tkey)
-                        foldedScreenByKey[tkey] = sid
+                    if !foldedKeys.contains(tkey), geometryStable(), hideFoldedWindow(top) {
+                        markFolded(key: tkey, sid: sid)
                         newMarks = true
                         log("fold (stuck): \(top.appName) cannot match its tile")
                     }
@@ -5042,9 +5116,68 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
             }
         }
+        // 固定窗最后再提一次：固定窗超格盖邻格，须在格顶之上才可见，否则会被邻格顶
+        // 盖住、固定看起来像没生效。Focus 期间本函数已提前返回，不干扰专注窗。
+        if !pinnedWindowKeys.isEmpty {
+            for w in collectWindows(includeFloated: true)
+                where pinnedWindowKeys.contains(winKey(w)) && screenID(screenForFrame(w.frame)) == sid {
+                AXUIElementPerformAction(w.element, kAXRaiseAction as CFString)
+            }
+        }
     }
 
-    // MARK: - accordion 折叠窄条
+    // MARK: - 焦点规则 / 折叠记账 / 几何稳定（2026-10-29 三件同轮）
+    /// 本轮前台焦点窗键：复用 resolveCurrentTarget 的口径（前台 App 的 AX 焦点窗，
+    /// 对不上退回该 App 第一扇受管窗），但用调用方本轮已采集的窗口，不重复枚举。
+    /// 定不出返回 nil（调用方只跳过折叠，不 fallback 到别的窗）。
+    /// 注意与 Focus 功能的 focusKey 不同：那是专注模式目标，这里是“正在用的窗”。
+    func frontFocusKey(windows: [WinInfo]) -> String? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return nil }
+        if let idx = focusedIndex(windows: windows), windows[idx].pid == app.processIdentifier {
+            return winKey(windows[idx])
+        }
+        return windows.first(where: { $0.pid == app.processIdentifier }).map { winKey($0) }
+    }
+
+    /// 折叠记账统一口：调用方已验 hideFoldedWindow 成功（先藏）再记；同时记原属屏
+    /// （最小化后 AX 帧不可靠，tileAll 据此归位）。
+    func markFolded(key: String, sid: CGDirectDisplayID) {
+        foldedKeys.insert(key)
+        foldedScreenByKey[key] = sid
+    }
+
+    /// 名义格帧：等分基线（share 0.5），不含求解器的份额收敛与让位调整。
+    /// 折叠门（min 门/帧门）以此为准：只有真正超名义格的窗才算超格；
+    /// 仅超让位后小格的窗是求解器的事（重分份额/并格），不由折叠门处理
+    /// （2026-10-29 级联：让位把格压到 738，正常窗 744 被帧门误折）。
+    func nominalTileFrames(count: Int, screen: NSScreen) -> [CGRect] {
+        let st = layoutSettings(for: screen)
+        return layoutFrames(count: count, vf: screen.visibleFrame, kind: st.kind, share: 0.5, gap: st.gap)
+    }
+
+    /// 几何稳定：任一屏可视区/屏帧变化后 2 秒内不折叠（显示切换瞬态几何不触发连锁折叠）。
+    /// 节流日志：不稳定期间每秒最多记一次，避免洪水刷屏。
+    func geometryStable() -> Bool {
+        let stable = Date().timeIntervalSince(geometryChangedAt) >= 2.0
+        if !stable, Date().timeIntervalSince(lastGeometrySkipLogAt) >= 1.0 {
+            lastGeometrySkipLogAt = Date()
+            log("fold skipped: geometry unstable")
+        }
+        return stable
+    }
+
+    /// 屏幕参数变化去抖：显示切换常连发多次通知，逐条立即重排会用瞬态几何连锁折叠；
+    /// 0.5 秒安静后只重排一次（日志仍逐条记，保留诊断信号）。
+    func scheduleScreenChangeRetile() {
+        screenChangeRetileTimer?.invalidate()
+        screenChangeRetileTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            self?.screenChangeRetileTimer = nil
+            self?.forceTile()
+        }
+    }
+
+    // MARK: - 折叠记账（最小化到 Dock）
     /// 超尺寸判定：任一轴最小尺寸超出格子（容差 1.5pt，与 topFitsSlot 同口径）。
     /// 注意不用 topFitsSlot：固定尺寸窗（格子大于其精确尺寸）不算超格，不能折。
     func isFoldOversize(_ w: WinInfo, slot: CGRect) -> Bool {
@@ -5054,11 +5187,11 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
-    /// 折叠窗隐藏：最小化（AX kAXMinimizedAttribute 置 true），并验一次确实已最小化。
+    /// 折叠窗隐藏：最小化（AX kAXMinimizedAttribute 置 true），并轮询验确实已最小化（上限约 1 秒）。
     /// 返回 true = 确实藏起来了；false = 最小化失败，调用方不得将其置入 foldedKeys
     /// （fail-safe：求解器绝不能以为折了、窗还看得见；失败窗仍按旧守卫处理）。
     /// 已最小化的窗不再重复写（Dock 动画只跑一次）；用户亲手从 Dock 恢复的折叠窗，
-    /// 下一轮仍会被重新最小化（折叠态的唯一出口是窄条展开/全部收起/激活展开）。
+    /// 下一轮仍会被重新最小化（焦点窗与固定窗除外：焦点取消折叠与固定豁免会先接手）。
     /// 旧屏外停放已删：系统会挡回屏外位置却写进尺寸（800x600 的块堆在格子原点），
     /// 求解器以为折走、现实还在屏上，模型一脱节布局就炸掉——最小化是唯一可靠的隐藏。
     func hideFoldedWindow(_ w: WinInfo) -> Bool {
@@ -5069,10 +5202,22 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return true
         }
         let err = AXUIElementSetAttributeValue(w.element, kAXMinimizedAttribute as CFString, kCFBooleanTrue)
-        if err == .success, boolAttr(w.element, kAXMinimizedAttribute as CFString) {
-            foldedMinimizedKeys.insert(key)
-            foldedElements[key] = w.element
-            return true
+        // 最小化是异步提交的：置属性只代表请求被接受，WindowServer/目标应用实际藏起
+        // 窗口需要一段时间；立即重读会看到还没藏起来的窗，全应用 err=0 失败就是这么
+        // 来的（2026-10-29 真机：授权已到、置调用无错、读已最小化窗本身是好的——采集
+        // 里 Dock 窗能正确跳过）。故置成功后轮询复核（40×25ms，上限约 1 秒，早到早返），
+        // 只有确实读到已最小化才算藏好；上限内没翻过来仍判失败，fail-safe 不变。
+        // 轮询只走置属性这条新折叠路径；已折叠窗每轮的复核走上面的已最小化早返，
+        // 不轮询、不阻塞稳态 tick。
+        if err == .success {
+            for _ in 0..<40 {
+                if boolAttr(w.element, kAXMinimizedAttribute as CFString) {
+                    foldedMinimizedKeys.insert(key)
+                    foldedElements[key] = w.element
+                    return true
+                }
+                Thread.sleep(forTimeInterval: 0.025)
+            }
         }
         log("fold minimize failed: \(w.appName) err=\(err.rawValue)")
         return false
@@ -5085,28 +5230,22 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return true
         }
         let err = AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-        if err == .success, !boolAttr(element, kAXMinimizedAttribute as CFString) {
-            foldedMinimizedKeys.remove(key)
-            return true
+        // 与最小化同理：取消最小化也是异步提交，立即重读会误判；置成功后轮询复核。
+        if err == .success {
+            for _ in 0..<40 {
+                if !boolAttr(element, kAXMinimizedAttribute as CFString) {
+                    foldedMinimizedKeys.remove(key)
+                    return true
+                }
+                Thread.sleep(forTimeInterval: 0.025)
+            }
         }
         log("fold unminimize failed: key=\(key) err=\(err.rawValue)")
         return false
     }
 
-    /// 取消全部折叠窗的最小化（收起/手风琴解除路径用）。单个失败只记日志、不中断其余；
-    /// 失败窗的键由调用方清掉后即为普通最小化窗（系统级隐藏），求解器不再把它当折叠态，
-    /// 不会出现“已解除折叠却仍被当成折叠”的模型脱节。只清最小化标记，不动 foldedKeys
-    /// 与 foldedScreenByKey（调用方按各自语义清；tileAll 归位过渡仍要用 foldedScreenByKey）。
-    func unminimizeAllFoldedWindows() {
-        for (key, el) in foldedElements {
-            _ = unminimizeFoldedWindow(element: el, key: key)
-        }
-        foldedMinimizedKeys.removeAll()
-    }
-
     /// 折叠存活裁剪（仿 pruneFloated 的宽口径：当前 Space AX 列表 + 全 Space CG 列表，
-    /// 否则切 Space 后折叠态会被误清；展开窗不在折叠集里，单按存活判）。
-    /// 展开窗已不在时连同全部折叠一起解除（与 tile() 手风琴分支的“展开窗消失”处理一致）。
+    /// 否则切 Space 后折叠态会被误清；单按存活判）。
     func pruneFolded(allKeys: Set<String>) {
         guard AXIsProcessTrusted() else { return }
         let wide = allSpaceWindowKeys()
@@ -5118,17 +5257,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let bar = key.firstIndex(of: "|"), let pid = pid_t(key[key.startIndex..<bar]) else { return false }
             return alivePids.contains(pid)
         }
-        if let ak = accordionKey, !isAlive(ak) {
-            // 展开窗已不在：先取消全部折叠窗的最小化再清键，否则窗会以最小化态丢在 Dock 里、无窄条可点。
-            unminimizeAllFoldedWindows()
-            accordionKey = nil
-            accordionScreen = nil
-            foldedKeys.removeAll()
-            foldedMinimizedKeys.removeAll()
-            foldedElements.removeAll()
-            log("accordion off: expanded window closed")
-        }
-        // 原属屏表不随 foldedKeys 为空而残留：收起后窗帧已真实，残留条目会在跨屏后错分；
+        // 原属屏表不随 foldedKeys 为空而残留：解除后窗帧已真实，残留条目会在跨屏后错分；
         // 同一 tileAll 内归位已先跑过（归位在裁剪之前），此处清掉不影响过渡。
         foldedScreenByKey = foldedScreenByKey.filter { foldedKeys.contains($0.key) }
         guard !foldedKeys.isEmpty else { return }
@@ -5141,171 +5270,6 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    /// 点窄条展开：该窗独占工作区，其余同屏窗全部折起（手风琴）。
-    /// 已展开别的窗时直接切换（旧展开窗随之折起）。窄条是非激活面板，点按不抢前台，
-    /// 故展开后把该 App 激活到前台；这一次激活在抑制期内，不再二次触发展开。
-    func expandFolded(_ key: String, suppressActivation: Bool = false) {
-        let all = collectWindows(includeFloated: true)
-        guard let w = all.first(where: { winKey($0) == key }) else {
-            // 窗已不在：清掉残留折叠键，免得窄条永远指着一扇死窗。
-            foldedKeys.remove(key)
-            foldedMinimizedKeys.remove(key)
-            foldedElements.removeValue(forKey: key)
-            foldedScreenByKey.removeValue(forKey: key)
-            log("fold expand skipped: window gone, key cleared")
-            return
-        }
-        // 先取消最小化再进手风琴分支（分支只摆位，不恢复可见性）；恢复失败则放弃展开，
-        // 折叠态保持（窗仍最小化、窄条仍在），不出现“展开了却看不见”的状态。
-        guard unminimizeFoldedWindow(element: w.element, key: key) else {
-            log("fold expand aborted: cannot unminimize \(w.appName)")
-            return
-        }
-        let sid = foldedScreenByKey[key] ?? screenID(screenForFrame(w.frame))
-        accordionKey = key
-        accordionScreen = sid
-        if suppressActivation { activationExpandSuppressedUntil = Date().addingTimeInterval(1.5) }
-        log("accordion expand: \(w.appName)")
-        forceTile()
-        if let app = NSRunningApplication(processIdentifier: w.pid) { app.activate() }
-    }
-
-    /// 点展开窗自己的窄条：全部收起，回到正常平铺。
-    /// 折叠集清掉后下一轮自动折叠重新算（仍超格的窗回到格内窄条，不弹回盖邻格）。
-    /// foldedScreenByKey 不在这里清：tileAll 的归位仍要用它把最小化窗分回原属屏，
-    /// 归位后 pruneFolded 会按折叠集裁掉。
-    func collapseAccordion() {
-        // 先取消全部折叠窗的最小化再清键：恢复即全部取消最小化，不得留一扇
-        // “已解除折叠却仍最小化”的窗（单个恢复失败只记日志，其键清掉后即为普通最小化窗）。
-        unminimizeAllFoldedWindows()
-        accordionKey = nil
-        accordionScreen = nil
-        foldedKeys.removeAll()
-        foldedMinimizedKeys.removeAll()
-        foldedElements.removeAll()
-        log("accordion collapse: all unfolded")
-        forceTile()
-    }
-
-    /// 窄条面板：折叠窗的呈现（覆盖式，不占格子几何）。
-    /// 常态：每格折叠成员在格顶缘向下叠（每条 28pt、占满格宽、显示 App 名）；
-    /// 手风琴展开态：屏顶缘（菜单栏下方）横向均分一行，展开窗窄条排第一且高亮。
-    func refreshFoldStrips() {
-        guard AXIsProcessTrusted(), autoTile, focusKey == nil, !cleanSpaceOn else {
-            hideFoldStrips()
-            return
-        }
-        var seen: Set<String> = []
-        for (sid, tiles) in lastTilesByScreen where !tiles.isEmpty {
-            guard let screen = NSScreen.screens.first(where: { screenID($0) == sid }) else { continue }
-            if accordionKey != nil, accordionScreen == sid {
-                // 手风琴行：合成单格的顶即展开窗，其余成员即全部折叠窗。
-                guard let tile = tiles.first else { continue }
-                let vf = screen.visibleFrame
-                let topKey = winKey(tile.top)
-                let keys = [topKey] + tile.stack.filter { winKey($0) != topKey }.map { winKey($0) }
-                let n = max(1, keys.count)
-                let w = vf.width / CGFloat(n)
-                for (idx, key) in keys.enumerated() {
-                    let rect = NSRect(x: vf.minX + CGFloat(idx) * w, y: vf.maxY - 28, width: w, height: 28)
-                    let name = tile.stack.first(where: { winKey($0) == key })?.appName ?? "?"
-                    seen.insert(key)
-                    placeFoldStrip(key: key, title: name, highlighted: key == accordionKey, rect: rect)
-                }
-                continue
-            }
-            for t in tiles {
-                var order = 0
-                for m in t.stack where foldedKeys.contains(winKey(m)) {
-                    let key = winKey(m)
-                    let rect = NSRect(x: t.frame.minX, y: t.frame.maxY - 28 * CGFloat(order + 1), width: t.frame.width, height: 28)
-                    seen.insert(key)
-                    placeFoldStrip(key: key, title: m.appName, highlighted: false, rect: rect)
-                    order += 1
-                }
-            }
-        }
-        for (key, panel) in foldStripPanels where !seen.contains(key) {
-            panel.orderOut(nil)
-            foldStripPanels.removeValue(forKey: key)
-            foldStripState.removeValue(forKey: key)
-        }
-    }
-
-    func placeFoldStrip(key: String, title: String, highlighted: Bool, rect: NSRect) {
-        if let panel = foldStripPanels[key] {
-            if let st = foldStripState[key], st.rect == rect, st.title == title, st.highlighted == highlighted {
-                // 呈现完全未变：不重建视图、不改帧，只保序。
-                panel.orderFrontRegardless()
-                return
-            }
-            panel.setFrame(rect, display: true)
-            if foldStripState[key]?.title != title || foldStripState[key]?.highlighted != highlighted {
-                // 仅标题/高亮变时才重建视图；只 rect 变时只移帧。
-                let font = NSFont.systemFont(ofSize: 12, weight: .medium)
-                let bg = highlighted ? highlightNSColor() : NSColor(srgbRed: 0.09, green: 0.09, blue: 0.1, alpha: 0.92)
-                let view = NSView(frame: NSRect(origin: .zero, size: rect.size))
-                view.wantsLayer = true
-                view.layer?.backgroundColor = bg.cgColor
-                let button = NSButton(title: title, target: self, action: #selector(foldStripClicked(_:)))
-                button.identifier = NSUserInterfaceItemIdentifier(key)
-                button.bezelStyle = .inline
-                button.isBordered = false
-                button.font = font
-                (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
-                button.attributedTitle = NSAttributedString(string: title, attributes: [
-                    .foregroundColor: NSColor.white,
-                    .font: font,
-                ])
-                button.frame = view.bounds
-                button.autoresizingMask = [.width, .height]
-                view.addSubview(button)
-                panel.contentView = view
-            }
-            panel.orderFrontRegardless()
-            foldStripState[key] = (rect, title, highlighted)
-            return
-        }
-        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        let bg = highlighted ? highlightNSColor() : NSColor(srgbRed: 0.09, green: 0.09, blue: 0.1, alpha: 0.92)
-        let view = NSView(frame: NSRect(origin: .zero, size: rect.size))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = bg.cgColor
-        let button = NSButton(title: title, target: self, action: #selector(foldStripClicked(_:)))
-        button.identifier = NSUserInterfaceItemIdentifier(key)
-        button.bezelStyle = .inline
-        button.isBordered = false
-        button.font = font
-        (button.cell as? NSButtonCell)?.lineBreakMode = .byTruncatingTail
-        button.attributedTitle = NSAttributedString(string: title, attributes: [
-            .foregroundColor: NSColor.white,
-            .font: font,
-        ])
-        button.frame = view.bounds
-        button.autoresizingMask = [.width, .height]
-        view.addSubview(button)
-        let panel = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
-        prepareOverlay(panel, level: .statusBar, ignoresMouse: false)
-        panel.contentView = view
-        panel.orderFrontRegardless()
-        foldStripPanels[key] = panel
-        foldStripState[key] = (rect, title, highlighted)
-    }
-
-    func hideFoldStrips() {
-        for (_, panel) in foldStripPanels { panel.orderOut(nil) }
-        foldStripPanels.removeAll()
-        foldStripState.removeAll()
-    }
-
-    @objc func foldStripClicked(_ sender: NSButton) {
-        guard let key = sender.identifier?.rawValue else { return }
-        if key == accordionKey {
-            collapseAccordion()
-        } else {
-            expandFolded(key, suppressActivation: true)
-        }
-    }
 
     // MARK: - 短弹簧（约 0.5s，轻微过冲，可被下一次布局打断）
 
@@ -6931,7 +6895,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     /// 图标在上、文字在下。不能点的时候文字仍然可读，按钮不接收点击。
-    func hoverColumn(_ title: String, symbol: String, action: Selector, enabled: Bool) -> NSButton {
+    /// emphasized = 激活态底色（如已固定的 Pin），即状态指示，不另加覆盖层。
+    func hoverColumn(_ title: String, symbol: String, action: Selector, enabled: Bool, emphasized: Bool = false) -> NSButton {
         let ink = NSColor.white.withAlphaComponent(enabled ? 1 : 0.55)
         let font = NSFont.systemFont(ofSize: 11, weight: .semibold)
         let b = NSButton(title: title, target: self, action: action)
@@ -6949,7 +6914,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         b.isEnabled = enabled
         b.wantsLayer = true
         b.layer?.cornerRadius = 8
-        b.layer?.backgroundColor = NSColor.white.withAlphaComponent(enabled ? 0.12 : 0.06).cgColor
+        b.layer?.backgroundColor = NSColor.white.withAlphaComponent(emphasized ? 0.18 : (enabled ? 0.12 : 0.06)).cgColor
         b.setContentCompressionResistancePriority(.required, for: .horizontal)
         return b
     }
@@ -7039,9 +7004,17 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let thirdTitle = floated ? "Unfloat" : "Float"
         let thirdSymbol = floated ? "square.grid.2x2" : "square.on.square"
         let thirdAction: Selector = floated ? #selector(hoverTileBack(_:)) : #selector(hoverFloat(_:))
+        // Pin 列：当前窗口已固定时高亮（按钮状态即固定指示，不新增常驻覆盖层）。
+        // 条出现/重建时按当时前台算一次（与 Primary 亮暗同一已知边角）。
+        let pinOn: Bool = {
+            let (wOpt, _) = resolveCurrentTarget()
+            guard let w = wOpt else { return false }
+            return pinnedWindowKeys.contains(winKey(w))
+        }()
         actions.addArrangedSubview(hoverColumn("Primary", symbol: "sidebar.left", action: #selector(hoverPrimary(_:)), enabled: primaryOn))
         actions.addArrangedSubview(hoverColumn(focus ? "Exit focus" : "Focus", symbol: "arrow.up.left.and.arrow.down.right", action: #selector(hoverFocus(_:)), enabled: focusOn))
         actions.addArrangedSubview(hoverColumn(thirdTitle, symbol: thirdSymbol, action: thirdAction, enabled: true))
+        actions.addArrangedSubview(hoverColumn(pinOn ? "Unpin" : "Pin", symbol: pinOn ? "pin.fill" : "pin", action: #selector(hoverPin(_:)), enabled: true, emphasized: pinOn))
         column.addArrangedSubview(actions)
         let pill = hoverBarView ?? NSView()
         for v in pill.subviews { v.removeFromSuperview() }
@@ -7542,6 +7515,40 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hideHoverBar()
             floatWindow(w, source: "hover")
         }
+    }
+
+    @objc func hoverPin(_ sender: NSButton) {
+        guard hoverActionArmed() else { log("pin skipped: not armed (400ms guard)"); return }
+        // 固定：当前窗口豁免全部折叠门（与焦点窗同级别），摆位不动、不居中重排，
+        // 超格就盖邻格直至取消固定；与 Focus/Float 正交，互不干扰。
+        // 目标跟着当前窗口走，不用条出现时记下的 hoverKey。
+        let (wOpt, failure) = resolveCurrentTarget()
+        guard let w = wOpt else { log("pin skipped: no current target (\(failure ?? "unknown"))"); return }
+        let key = winKey(w)
+        if pinnedWindowKeys.contains(key) {
+            pinnedWindowKeys.remove(key)
+            log("unpin: \(w.appName)")
+            hideHoverBar()
+            forceTile()
+            refreshPanel()
+            return
+        }
+        // 已折叠的窗先取消最小化再固定，让人看得见自己固定的窗；恢复失败则不固定。
+        if foldedKeys.contains(key) {
+            guard unminimizeFoldedWindow(element: w.element, key: key) else {
+                log("pin skipped: cannot unminimize \(w.appName)")
+                return
+            }
+            foldedKeys.remove(key)
+            foldedMinimizedKeys.remove(key)
+            foldedElements.removeValue(forKey: key)
+            foldedScreenByKey.removeValue(forKey: key)
+        }
+        pinnedWindowKeys.insert(key)
+        log("pin: \(w.appName)")
+        hideHoverBar()
+        forceTile()
+        refreshPanel()
     }
 
     // 活动格细描边（Borders）和其他格子的暗色层（No peek，强度由 Dim 决定）。
