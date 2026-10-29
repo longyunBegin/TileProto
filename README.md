@@ -24,7 +24,7 @@ macOS 菜单栏自动窗口平铺：窗口一打开就排进格子，关掉就�
 
 ## 安装
 
-从 [Releases](https://github.com/longyunBegin/TileProto/releases) 下载 `TileProto-v0.1.0.dmg`，拖到 Applications，打开即可。应用只出现在菜单栏，不占 Dock。
+从 [Releases](https://github.com/longyunBegin/TileProto/releases) 下载 `TileProto-v0.1.1.dmg`，拖到 Applications，打开即可。应用只出现在菜单栏，不占 Dock。
 
 未签名说明：本应用没有 Apple 开发者签名。macOS 首次打开可能报“已损坏”，执行一次即可：
 
