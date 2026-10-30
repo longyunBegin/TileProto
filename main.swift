@@ -236,7 +236,7 @@ func overflowStackTargets(windowCount: Int, tileCount: Int, active: Int) -> [Int
     return (0..<windowCount).map { $0 < n ? $0 : act }
 }
 
-/// 这一族要露出来才叫这个布局的格数。Grid 要 4，否则和 Side 的三格是同一张图。
+/// 这一族要露出来才叫这个布局的格数。Grid 的完整外形是 4 格；3 格时 Grid 是 2×2 缺右下，与 Side 的「一块大、两块小」不再是同一张图。
 /// Columns / Rows / Side 从 3 格起才不是「左右对半分」或「一整屏」。
 func familyShapeCount(_ kind: LayoutKind) -> Int {
     switch kind {
@@ -265,10 +265,35 @@ func spanShare(count: Int, share: CGFloat) -> CGFloat {
     return min(max(share, 0.4), 0.75)
 }
 
+/// 退化均分：剩余空间连 gap 都放不下时仍把屏幕切成互不相交的条带
+/// （均分、贴边），绝不返回“全部格子等于整个可见区”。格子小于最小尺寸
+/// 的窗按尺寸适配规则进 Dock，而不是靠格子重叠来放。
+func degenerateStripFrames(vf: CGRect, count n: Int, horizontal: Bool) -> [CGRect] {
+    let c = max(n, 1)
+    if horizontal {
+        let w = max(1, vf.width / CGFloat(c))
+        return (0..<c).map { CGRect(x: vf.minX + CGFloat($0) * w, y: vf.minY, width: w, height: max(1, vf.height)) }
+    }
+    let h = max(1, vf.height / CGFloat(c))
+    return (0..<c).map { CGRect(x: vf.minX, y: vf.minY + CGFloat($0) * h, width: max(1, vf.width), height: h) }
+}
+
+/// 退化 2×2 网格（左上、右上、右下、左下），均分贴边、互不相交。
+func degenerateGrid2x2Frames(vf: CGRect) -> [CGRect] {
+    let colW = max(1, vf.width / 2)
+    let rowH = max(1, vf.height / 2)
+    return [
+        CGRect(x: vf.minX, y: vf.minY + rowH, width: colW, height: rowH),
+        CGRect(x: vf.minX + colW, y: vf.minY + rowH, width: colW, height: rowH),
+        CGRect(x: vf.minX + colW, y: vf.minY, width: colW, height: rowH),
+        CGRect(x: vf.minX, y: vf.minY, width: colW, height: rowH),
+    ]
+}
+
 func columnFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
     guard n > 1 else { return [vf] }
     let inner = vf.width - g * CGFloat(n + 1)
-    guard inner > CGFloat(n) else { return Array(repeating: vf, count: n) }
+    guard inner > CGFloat(n) else { return degenerateStripFrames(vf: vf, count: n, horizontal: true) }
     let fraction = spanShare(count: n, share: share)
     let floor = min(120, inner / CGFloat(n))
     var primary = inner * fraction
@@ -290,7 +315,7 @@ func columnFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [
 func rowFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
     guard n > 1 else { return [vf] }
     let inner = vf.height - g * CGFloat(n + 1)
-    guard inner > CGFloat(n) else { return Array(repeating: vf, count: n) }
+    guard inner > CGFloat(n) else { return degenerateStripFrames(vf: vf, count: n, horizontal: false) }
     let fraction = spanShare(count: n, share: share)
     let floor = min(80, inner / CGFloat(n))
     var primary = inner * fraction
@@ -314,7 +339,19 @@ func sideFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CG
     guard n > 1 else { return [vf] }
     let rows = n - 1
     let innerW = vf.width - 3 * g
-    guard innerW > 2 else { return Array(repeating: vf, count: n) }
+    guard innerW > 2 else {
+        // 退化：左格 + 右列均分贴边，左右贴边、上下贴边，互不相交。
+        let leftW = max(1, vf.width / 2)
+        let left = CGRect(x: vf.minX, y: vf.minY, width: leftW, height: max(1, vf.height))
+        let rightX = vf.minX + leftW
+        let rightW = max(1, vf.width - leftW)
+        let rowH = max(1, vf.height / CGFloat(rows))
+        var out = [left]
+        for r in 0..<rows {
+            out.append(CGRect(x: rightX, y: vf.minY + CGFloat(r) * rowH, width: rightW, height: rowH))
+        }
+        return out
+    }
     let fraction = min(max(share, 0.4), 0.75)
     let floor = min(160, innerW / 2)
     var leftW = innerW * fraction
@@ -335,13 +372,42 @@ func sideFrames(count n: Int, vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CG
     return out
 }
 
+/// Grid 三格：标准 2×2 网格缺右下（左上、右上、左下），不再复用 Side 的
+/// 「一块大、两块小」——否则切到 Grid 与切到 Side 是同一张图。列宽按份额分
+/// （0.5 等分，与 columnFrames 同口径），行高等分；右下空着，不补窗。
+func grid3Frames(vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
+    let innerW = vf.width - 3 * g
+    let innerH = vf.height - 3 * g
+    guard innerW > 2, innerH > 2 else {
+        // 退化：2×2 缺右下（左上、右上、左下），均分贴边、互不相交。
+        let cells = degenerateGrid2x2Frames(vf: vf)
+        return [cells[0], cells[1], cells[3]]
+    }
+    let fraction = spanShare(count: 2, share: share)
+    let floor = min(120, innerW / 2)
+    var leftW = innerW * fraction
+    if leftW > innerW - floor { leftW = innerW - floor }
+    if leftW < floor { leftW = floor }
+    let rightW = max(1, innerW - leftW)
+    let rowH = max(1, innerH / 2)
+    let leftX = vf.minX + g
+    let rightX = leftX + max(1, leftW) + g
+    let topY = vf.maxY - g - rowH
+    let botY = vf.minY + g
+    return [
+        CGRect(x: leftX, y: topY, width: max(1, leftW), height: rowH),
+        CGRect(x: rightX, y: topY, width: rightW, height: rowH),
+        CGRect(x: leftX, y: botY, width: max(1, leftW), height: rowH),
+    ]
+}
+
 /// Grid 四格：先做成左大右二，再把左侧竖直对半。主格份额只拉宽左列，左右列内部高度各一半。
 func gridFold4Frames(vf: CGRect, gap g: CGFloat, share: CGFloat) -> [CGRect] {
     let tri = sideFrames(count: 3, vf: vf, gap: g, share: share)
-    guard tri.count == 3 else { return Array(repeating: vf, count: 4) }
+    guard tri.count == 3 else { return degenerateGrid2x2Frames(vf: vf) }
     let left = tri[0]
     let innerH = left.height - g
-    guard innerH > 2 else { return Array(repeating: vf, count: 4) }
+    guard innerH > 2 else { return degenerateGrid2x2Frames(vf: vf) }
     let topH = (innerH * 0.5).rounded()
     let botH = max(1, innerH - topH)
     let bot = CGRect(x: left.minX, y: left.minY, width: left.width, height: botH)
@@ -354,7 +420,11 @@ func layoutFrames(count: Int, vf: CGRect, kind: LayoutKind, share: CGFloat, gap:
     let n = min(max(count, 0), 4)
     guard n > 0 else { return [] }
     let g = min(max(0, gap), min(vf.width, vf.height) * 0.2)
-    if vf.width < 2 || vf.height < 2 { return [vf] }
+    if vf.width < 2 || vf.height < 2 {
+        // 极小可见区也不得让多格共用同一帧：均分贴边（单格仍返回自身）。
+        if n <= 1 { return [vf] }
+        return degenerateStripFrames(vf: vf, count: n, horizontal: kind != .rows)
+    }
     // 一格也走间距：边距与窗缝同一套。
     if n == 1 {
         if g < 0.5 { return [vf] }
@@ -369,8 +439,8 @@ func layoutFrames(count: Int, vf: CGRect, kind: LayoutKind, share: CGFloat, gap:
     case .side:
         return sideFrames(count: n, vf: vf, gap: g, share: share)
     case .grid:
-        // 三格是「一块大、两块小」，不是三条等分。四格是左列对半 + 右列两格。
-        if n == 3 { return sideFrames(count: 3, vf: vf, gap: g, share: share) }
+        // 三格是 2×2 网格缺右下，不再是 Side 的「一块大、两块小」。四格是左列对半 + 右列两格。
+        if n == 3 { return grid3Frames(vf: vf, gap: g, share: share) }
         if n == 4 { return gridFold4Frames(vf: vf, gap: g, share: share) }
         return columnFrames(count: n, vf: vf, gap: g, share: share)
     }
@@ -619,7 +689,7 @@ func layoutCaption(kind: LayoutKind, count: Int) -> String {
         switch n {
         case 1: phrase = "Full screen"
         case 2: phrase = "Side by side"
-        case 3: phrase = "One big, two small"
+        case 3: phrase = "Two by two, three filled"
         default: phrase = "Grid of four"
         }
     case .columns:
@@ -2062,7 +2132,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             showToast(v == 1 ? "1 window" : "Up to \(v) windows", detail: "On this screen.", on: activeScreen())
         }
-        forceTile()
+        applyLayoutSwitchOneShot()
         refreshPanel()
         refreshSettingsIfOpen()
     }
@@ -2253,7 +2323,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             showToast(layoutName(kind), on: screen)
         }
-        forceTile()
+        applyLayoutSwitchOneShot()
         refreshPanel()
         refreshSettingsIfOpen()
     }
@@ -2267,6 +2337,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         setSettingsFor(st, screen: activeScreen())
         log("share -> \(sender.title)")
         showToast("Main window \(sender.title)", detail: "The others share the rest.", on: activeScreen())
+        // 份额是格子几何参数：改份额必须全量重算并重记冻结布局，
+        // 否则冻结轮次会把格子写回旧份额帧。
+        oneShotFreshScreens.insert(screenID(activeScreen()))
         forceTile()
         refreshPanel()
         refreshSettingsIfOpen()
@@ -2281,6 +2354,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         gapValueLabel?.stringValue = "\(Int(g))"
         setSettingsFor(st, screen: activeScreen())
         log("gap -> \(Int(g))")
+        // 间距同为几何参数：改间距必须全量重算并重记冻结布局。
+        oneShotFreshScreens.insert(screenID(activeScreen()))
         forceTile()
         refreshPanel()
         refreshSettingsIfOpen()
@@ -3247,7 +3322,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forceTile()
         }
         // 折叠窗的 App 被前台激活时普通恢复：只取消这一扇窗的最小化，不独占、
-        // 不折其他窗（手风琴展开已撤）。恢复后的窗是焦点，焦点取消折叠保护它不立刻再折。
+        // 不折其他窗（手风琴展开已撤）。恢复后的窗记为“用户打开窗”（留存态）：
+        // 先试缩进格，真缩不进就浮着留下来；留存期只在切族/改上限、窗关闭、
+        // 用户亲手最小化时结束，集合变化与焦点切换不得清掉它。
         // 拖动中不恢复；恢复失败则保持折叠态（仍在 Dock 里，不丢窗）。
         if let front = NSWorkspace.shared.frontmostApplication,
            front.processIdentifier != lastFrontmostPid {
@@ -3262,7 +3339,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         foldedMinimizedKeys.remove(key)
                         foldedElements.removeValue(forKey: key)
                         foldedScreenByKey.removeValue(forKey: key)
-                        log("fold restore: \(t.appName)")
+                        userOpenedKeys.insert(key)
+                        log("fold restore: \(t.appName) (user opened, retained)")
                     } else {
                         log("fold restore skipped: cannot unminimize \(t.appName)")
                     }
@@ -3338,12 +3416,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         for m in t.stack {
                             let mk = winKey(m)
                             seenFrameWatchKeys.insert(mk)
-                            // 焦点规则：正在用的窗不折，且清掉帧门计数（焦点离开后重新计 2 轮，不立刻折）。
-                            if mk == frontFocusKeyForPass {
+                            // 用户打开窗：留存期内不计数（tick 不重折、不推回）；
+                            // 留存只在切族/改上限、窗关闭、用户亲手最小化时清掉。
+                            // 已落位冻结窗同样不计数：tick 的名义格帧按 shown 叠数
+                            // 等分，与冻结格帧未必一致，误计会把已落位窗折掉。
+                            if userOpenedKeys.contains(mk) || isFrozenWindowKey(mk) {
                                 frameOversizeWatch.removeValue(forKey: mk)
                                 continue
                             }
-                            // 固定窗同豁免：固定期间不折，且清掉帧门计数（取消固定后重新计 2 轮，不立刻折）。
+                            // 固定窗豁免：固定期间不折，且清掉帧门计数（取消固定后重新计 2 轮，不立刻折）。
                             if pinnedWindowKeys.contains(mk) {
                                 frameOversizeWatch.removeValue(forKey: mk)
                                 continue
@@ -3437,9 +3518,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                   !floatedKeys.contains(mk), !foldedKeys.contains(mk),
                                   frameMotions[mk] == nil,
                                   let mw = live.first(where: { winKey($0) == mk }) else { continue }
-                            // 焦点窗盖邻格是允许的临时态：不推回、不记成员-only、不折叠。
-                            if mk == frontFocusKeyForPass { continue }
+                            // 用户打开窗与已落位冻结窗：tick 不动它（不重折、
+                            // 不推回、不记成员-only；冻结窗的顶归属由冻结布局定）。
+                            if userOpenedKeys.contains(mk) || isFrozenWindowKey(mk) { continue }
                             // 固定窗盖邻格同样允许：固定期间不推回、不记成员-only、不折叠。
+                            // 焦点窗不再豁免（焦点与非焦点同一规则）：盖邻格的焦点窗
+                            // 同样记成员-only，下一轮求解即按尺寸适配规则处理。
                             if pinnedWindowKeys.contains(mk) { continue }
                             guard coversAnyOtherPane(mw.frame, cellIndex: tileIndex, tiles: tiles) else {
                                 overflowSnapStuck.removeValue(forKey: mk)
@@ -3527,14 +3611,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                        abs(w.frame.maxX - logged.maxX) < 1.5, abs(w.frame.maxY - logged.maxY) < 1.5 {
                         continue
                     }
-                    // 焦点窗盖邻格是允许的临时态：不推回、不记成员-only、不折叠
-                    // （弹回与精确性检查在前，已正常跑；只跳过盖邻格处理）。
-                    if key == frontFocusKeyForPass {
+                    // 用户打开窗：留存期内不动它（tick 不重折、不推回）。
+                    // 已落位冻结顶不在此列：推回是恢复冻结帧（非重算），仍允许。
+                    if userOpenedKeys.contains(key) {
                         overflowSnapStuck.removeValue(forKey: key)
                         coverLoggedFrame.removeValue(forKey: key)
                         continue
                     }
                     // 固定窗盖邻格同样允许：固定期间不推回、不记成员-only、不折叠。
+                    // 焦点窗不再豁免（焦点与非焦点同一规则）。
                     if pinnedWindowKeys.contains(key) {
                         overflowSnapStuck.removeValue(forKey: key)
                         coverLoggedFrame.removeValue(forKey: key)
@@ -3585,6 +3670,13 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             pendingTicks = 0
             return
         }
+        // 几何不稳定期推迟的折叠：稳定后签名未变、tick 门也不会开，
+        // 这里单独补一次 forceTile；deferredFoldDue 内已复核仍超格才触发，
+        // 补完即走当轮求解的正常折叠路径，不循环。
+        if deferredFoldDue(windows: tickWindows) {
+            forceTile()
+            return
+        }
         let sig = screenSignature(windows: tickWindows)
         if sig == lastSignature {
             pendingSignature = ""
@@ -3596,16 +3688,15 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let dragging = NSEvent.pressedMouseButtons != 0 || draggingDividerID != nil
             || pendingDrag != nil
         if !dragging {
-            lastSignature = sig
-            pendingSignature = ""
-            pendingTicks = 0
-            tileAll(windowsByScreen: Dictionary(grouping: tickWindows, by: { screenID(screenForFrame($0.frame)) }))
-            // 新窗口刚创建时可能还不接受位置设置，0.5 秒后补一次（仅当集合未再变化）
+            // 集合变化立即重算：一shot 方案一次算好、一次写完，写后基线即应用后状态。
+            runOneShot(source: "tick")
+            // 新窗口刚创建时可能还不接受位置设置，0.5 秒后只补写（不重算）：
+            // 仍偏离上一轮方案目标帧的窗各写一次，格数/格子/顶不重新定。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self = self else { return }
                 let all = self.collectWindows()
                 if self.screenSignature(windows: all) == self.lastSignature {
-                    self.tileAll(windowsByScreen: Dictionary(grouping: all, by: { self.screenID(self.screenForFrame($0.frame)) }))
+                    self.reapplyOneShotPlan()
                 }
             }
             return
@@ -3617,16 +3708,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         pendingTicks += 1
         if pendingTicks >= 2 {
-            lastSignature = sig
-            pendingSignature = ""
-            pendingTicks = 0
-            tileAll(windowsByScreen: Dictionary(grouping: tickWindows, by: { screenID(screenForFrame($0.frame)) }))
-            // 新窗口刚创建时可能还不接受位置设置，0.5 秒后补一次（仅当集合未再变化）
+            // 防抖后重算：同样走一shot，写后基线即应用后状态。
+            runOneShot(source: "tick")
+            // 0.5 秒后只补写不重算（见上）。
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 guard let self = self else { return }
                 let all = self.collectWindows()
                 if self.screenSignature(windows: all) == self.lastSignature {
-                    self.tileAll(windowsByScreen: Dictionary(grouping: all, by: { self.screenID(self.screenForFrame($0.frame)) }))
+                    self.reapplyOneShotPlan()
                 }
             }
         }
@@ -3642,12 +3731,10 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             log("forceTile skipped: Stage Manager paused")
             return
         }
-        pruneFloated()
-        let all = collectWindows()
-        lastSignature = screenSignature(windows: all)
-        pendingSignature = ""
-        pendingTicks = 0
-        tileAll(windowsByScreen: Dictionary(grouping: all, by: { screenID(screenForFrame($0.frame)) }))
+        // 平时重算统一走一shot：一次算好完整方案 → 一次写完即停。
+        // 面板、悬停条、拖动落点、折叠恢复、屏幕/拒写定时器、demote 异步补跑等
+        // 全部经此入口，不再走逐窗写帧 + 落定复核 + 异步补跑的老路径。
+        runOneShot(source: "forceTile")
     }
 
     // 签名只含每个 App 的窗口数：标题变化不触发重排，打开/关闭/最小化才触发
@@ -4235,7 +4322,320 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // 全屏重排：遍历当前全部屏；断开屏的残留磁贴/frame/活动记录一并清理，
     // 避免握把、高亮、暗色层留在已不存在的屏上
-    func tileAll(windowsByScreen: [CGDirectDisplayID: [WinInfo]]? = nil) {
+    // MARK: - 换布局一shot（v0.1.1 底本上新增，2026-10-29）
+    // 换族（applyLayoutKind）与改上限（applyLimit）专用，两阶段，缺一不可：
+    // 1. 算阶段：tileAll(oneShot: true) → tile() 的求解段（computeTiles → planTileFit →
+    //    solveTopFit → 自动折叠判定）算出完整方案，全程不写 AX。快照只采一次
+    //    （collectWindows + 一次前台焦点判定 + 每轮 AX 最小尺寸缓存）；算阶段内
+    //    不重读实时帧、不重解、不触发重排。装不下的判定是算阶段的一部分：
+    //    用窗口已知最小尺寸（AX 最小值 / 已学最小尺寸，v0.1.1 已有的 effectiveMin）
+    //    对照分到的名义格子（nominalTileFrames，等分基线；与 v0.1.1 自动折叠门同口径，
+    //    让位后的小格不触发误折），格子小于最小尺寸的窗口在算方案时就定为
+    //    折叠（非焦点）或保留盖邻格（焦点 / Pin），不等写帧时才发现写不进去再返工。
+    // 2. 写阶段：applyOneShotPlan 按稳定顺序把方案各写一次（帧用
+    //    hardenPaneFrame 直接写，不读回校验）、折叠决定各执行一次（沿用 v0.1.1
+    //    已有的最小化验证），写完即停；本轮本身不触发第二轮。
+    // 平时重算已统一走同一套机器：forceTile 与 tick 的重算入口全部经 runOneShot，
+    // 与切换布局共用算方案 + 写方案函数，不另起第二套机器；手势自有帧
+    // （拖动、⌘交换、悬停条拖动中的 placeFrame）不在重算入口内，保持原样。
+    struct OneShotPlacement { let win: WinInfo; let frame: CGRect }
+    struct OneShotFold { let win: WinInfo; let sid: CGDirectDisplayID; let need: CGSize; let slot: CGRect }
+    var oneShotActive = false
+    var oneShotApplying = false  // 写阶段内到达的重算请求直接丢弃，不排队、不异步补跑
+    var oneShotLastPlacements: [OneShotPlacement] = []  // 上一轮方案的帧，供 0.5 秒补写只重写不重算
+    var oneShotPlacements: [OneShotPlacement] = []
+    var oneShotFolds: [OneShotFold] = []
+    var oneShotKeeps: [String: CGRect] = [:]
+    var oneShotRaiseTops: [WinInfo] = []
+    var oneShotFocusCaptions: [NSScreen] = []
+    // 一shot算阶段的复核顶：只记各格显示顶（栈内非顶成员不复核，
+    // 它们共用格帧、只露顶，AX 钳住也不算超格）。写阶段一次读回，
+    // 仍超格的顶当轮即按塞不进处理、折进 Dock。
+    struct OneShotVerifyTop { let win: WinInfo; let slot: CGRect; let sid: CGDirectDisplayID }
+    var oneShotVerifyTops: [OneShotVerifyTop] = []
+    // 本轮冻结窗键：供写阶段过滤 0.5 秒补写（补写不得把已落位窗写回冻结帧，
+    // 冻结窗的帧由冻结布局定、补写只保护本轮新落点的窗）。
+    var oneShotFrozenKeys: Set<String> = []
+    // 几何不稳定期推迟的折叠键：求解时超格但因几何不稳定没折的窗，
+    // 稳定后由 tick 补折，不静默丢失（基线更新不会吞掉它）。
+    var deferredFoldKeys: Set<String> = []
+    // 拒缩折叠失败记忆：键 -> 失败时的全屏签名。同一签名下不再重尝试折叠，
+    // 只在真实变化（切族/改上限/窗口集合变化）时再试，避免每 2 秒重触发整轮。
+    var foldFailedKeys: [String: String] = [:]
+    // 用户亲手从 Dock 点开的窗（留存态）：从点开起必须留下来，能缩进格就缩，
+    // 真缩不进就浮着显示；只在切族/改上限、窗关闭、用户亲手最小化时清掉。
+    // 屏幕集合变化、焦点切换、其他窗开/关一律不得清掉（旧宽限“签名一变即清”的口子已删）。
+    var userOpenedKeys: Set<String> = []
+    // 留存窗里已确认真拒缩、正在浮着显示的窗：求解不再给它写格子帧（只记当前帧为已落点），
+    // 直到留存期结束；与 userOpenedKeys 一起清掉。
+    var userFloatedKeys: Set<String> = []
+    // 已落位冻结：上次全量布局（切族/改上限/首次铺格）定死的格子帧与窗口归属，
+    // 计算格顺序存（显示侧经置换翻译）。tick、焦点切换、屏幕通知、开窗/关窗
+    // 都不得重算已落位窗，只有换布局全量重算；几何失效（冻结帧超出当前可视区）
+    // 时自动退回全量重算并重新记录（外接屏插拔/分辨率变化的安全阀）。
+    struct FrozenLayout {
+        var tileFrames: [CGRect]      // 计算格顺序的格子帧
+        var assignment: [[String]]    // 计算格顺序的窗口键（栈顺序）
+        var topKeys: [String?]        // 计算格顺序的显示顶键（栈顶下标漂移时的兜底）
+    }
+    var frozenLayoutByScreen: [CGDirectDisplayID: FrozenLayout] = [:]
+    // 某键是否在任一屏的冻结归属里（tick 守卫、非一shot 摆位用；格数小，线性查即可）。
+    func isFrozenWindowKey(_ key: String) -> Bool {
+        for layout in frozenLayoutByScreen.values {
+            if layout.assignment.contains(where: { $0.contains(key) }) { return true }
+        }
+        return false
+    }
+    // 切换族/上限时从头重算的屏：本轮 tile() 忽略上一布局的求解态（活动格、
+    // 超格成员-only 标记、栈顶、格子置换）；手动堆叠与 Primary 是用户态，保留。
+    // 只在本轮存活，runOneShot 返回时（即使因写阶段门提前返回）清空。
+    var oneShotFreshScreens: Set<CGDirectDisplayID> = []
+
+    /// 满格浮动窗的纯计算落点：与 floatWhenFull 同一套几何（工作区内缩、当前尺寸
+    /// 夹取、按步错开），但只用快照帧尺寸，不读 AX、不写 AX。step 为本轮之前
+    /// 已浮动窗的数量，与 floatWhenFull 插入顺序一致。
+    func oneShotFloatFrame(_ w: WinInfo, on screen: NSScreen, step: Int) -> CGRect {
+        let box = insetWorkArea(on: screen)
+        let cur = w.frame.size
+        let width = min(max(cur.width > 1 ? cur.width : 480, 80), box.width)
+        let height = min(max(cur.height > 1 ? cur.height : 320, 60), box.height)
+        var frame = CGRect(x: box.midX - width / 2, y: box.midY - height / 2, width: width, height: height)
+        if step > 0 {
+            let col = CGFloat(step % 5)
+            let row = CGFloat(step / 5)
+            frame.origin.x = min(max(frame.minX + col * 30, box.minX), max(box.minX, box.maxX - width))
+            frame.origin.y = min(max(frame.minY - row * 30, box.minY), max(box.minY, box.maxY - height))
+        }
+        return frame
+    }
+
+    /// 平时重算与切换布局共用的一shot入口：一次算好完整方案 → 一次写完即停。
+    /// 算阶段 tileAll(oneShot: true) 只记方案不写 AX；写阶段 applyOneShotPlan 同步执行。
+    /// 写阶段内到达的重算请求直接丢弃（oneShotApplying 门），不排队、不异步补跑；
+    /// 只有窗口集合、布局族/上限、Space、显示器确实变化了的新事件，才能触发下一轮。
+    /// 写完后把签名基线更新为应用后状态（折叠窗已离开可见集合），下一轮 tick
+    /// 见不到差异就不再重算；焦点变化本身不改变签名，故不触发重写帧。
+    func runOneShot(source: String) {
+        // 从头重算标记只活本轮：写阶段门提前返回、正常返回都清，不残留到下一轮。
+        defer { oneShotFreshScreens.removeAll() }
+        if oneShotApplying {
+            log("oneshot: re-tile dropped during apply, source=\(source)")
+            return
+        }
+        pruneFloated()
+        let all = collectWindows()
+        // 推迟集与留存集只对仍在世的窗有效；已折叠的窗不再是推迟对象
+        // （帧门已把它藏好，推迟集留着只会误触发）。已关闭的窗清掉留存态。
+        let allKeys = Set(all.map { winKey($0) })
+        deferredFoldKeys.formIntersection(allKeys)
+        deferredFoldKeys.subtract(foldedKeys)
+        foldFailedKeys = foldFailedKeys.filter { allKeys.contains($0.key) }
+        userOpenedKeys.formIntersection(allKeys)
+        userFloatedKeys.formIntersection(allKeys)
+        log("oneshot begin: source=\(source) windows=\(all.count)")
+        lastSignature = screenSignature(windows: all)
+        pendingSignature = ""
+        pendingTicks = 0
+        tileAll(windowsByScreen: Dictionary(grouping: all, by: { screenID(screenForFrame($0.frame)) }), oneShot: true)
+        log("oneshot plan: placements=\(oneShotPlacements.count) folds=\(oneShotFolds.count) keeps=\(oneShotKeeps.count)")
+        applyOneShotPlan(source: source)
+        // 应用后基线：直接用本轮输入快照算签名，不再减去已折叠/新浮动的窗。
+        // collectWindows 会把已折叠的最小化窗留在采集里（折叠放行），减掉它们
+        // 的基线永远对不上次轮采集，tick 每秒误触发——这是循环的驱动之一。
+        // 不减基线时：折叠粘住后次轮采集与基线一致，tick 即停；开窗/关窗等
+        // 真实变化仍会改变签名并触发新一轮，不会被基线吞掉。
+        lastSignature = screenSignature(windows: all)
+        pendingSignature = ""
+        pendingTicks = 0
+    }
+
+    /// 写阶段：按稳定顺序把算阶段的方案各执行一次即停。
+    /// 已在目标帧上的窗口直接跳过不写（v0.1.1 的 frameMatchesSlot，1.5pt 口径，不引入新容差）。
+    /// 折叠决定各执行一次（沿用最小化验证）；保留窗不写不折，只记快照帧为已落点。
+    func applyOneShotPlan(source: String) {
+        oneShotApplying = true
+        defer { oneShotApplying = false }
+        var written = 0
+        var skipped = 0
+        for p in oneShotPlacements {
+            if frameMatchesSlot(p.win.frame, pane: p.frame) {
+                skipped += 1
+                continue
+            }
+            hardenPaneFrame(p.win.element, p.frame)
+            lastPlacedFrames[winKey(p.win)] = p.frame
+            written += 1
+        }
+        for f in oneShotFolds {
+            let k = winKey(f.win)
+            if hideFoldedWindow(f.win) {
+                log("fold (oversize): \(f.win.appName) min \(Int(f.need.width))x\(Int(f.need.height)) > slot \(Int(f.slot.width))x\(Int(f.slot.height))")
+            } else {
+                foldedKeys.remove(k)
+                foldedMinimizedKeys.remove(k)
+                foldedElements.removeValue(forKey: k)
+                foldedScreenByKey.removeValue(forKey: k)
+                log("fold minimize failed: \(f.win.appName), unfolded for fallback")
+            }
+        }
+        // AX 拒缩复核（当轮两次读回，不循环、不重解）：直写后 0.2 秒读回仍超格
+        // 的显示顶，再等 0.8 秒二次读回（区分动画没跟上与真拒缩）；仍超格的顶，
+        // 非留存窗当轮即按塞不进处理、折进 Dock，用户打开窗则浮着留存不折回。
+        // 只验显示顶（栈内成员共用格帧、不复核）；Pin 顶豁免。
+        // 复核折叠同样记入 oneShotFolds（恰好执行一次、应用日志里计数一致），
+        // 且不进 0.5 秒补写（补写不得把已折的窗再写回格子帧）。
+        if !oneShotVerifyTops.isEmpty {
+            // 写后读回前先静置一次：AX 写入可能是动画/排队落点，立即读回会
+            // 读到旧帧、误判拒缩。只静置一次，不轮询、不重解。
+            Thread.sleep(forTimeInterval: 0.2)
+            let live = collectWindows()
+            let liveSig = screenSignature(windows: live)
+            for v in oneShotVerifyTops {
+                let k = winKey(v.win)
+                // 用户打开窗同样进复核：它先试缩，复核定它是缩进格还是浮着留存。
+                // Pin 顶豁免（原宽限豁免已删：留存窗不再靠“不写不折”过关）。
+                guard !pinnedWindowKeys.contains(k), !foldedKeys.contains(k),
+                      let w0 = live.first(where: { winKey($0) == k }) else { continue }
+                // 诊断帧格式：x,y WxH；axMin 读不到（两维都 ≤1）写 unknown，单维未知写 ?。
+                // 诊断只在二次读回被触发时记，不每轮刷屏。
+                func fmtFrame(_ r: CGRect) -> String { "\(Int(r.minX)),\(Int(r.minY)) \(Int(r.width))x\(Int(r.height))" }
+                func fmtAxMin(_ s: CGSize) -> String {
+                    if s.width > 1, s.height > 1 { return "\(Int(s.width))x\(Int(s.height))" }
+                    if s.width > 1 { return "\(Int(s.width))x?" }
+                    if s.height > 1 { return "?x\(Int(s.height))" }
+                    return "unknown"
+                }
+                var w = w0
+                var secondReadback = false
+                // 0.2 秒读回仍超格：再等 0.8 秒二次读回，区分动画没跟上与真拒缩。
+                if w.frame.width > v.slot.width + 1.5 || w.frame.height > v.slot.height + 1.5 {
+                    Thread.sleep(forTimeInterval: 0.8)
+                    let live2 = collectWindows()
+                    guard let w2 = live2.first(where: { winKey($0) == k }) else { continue }
+                    w = w2
+                    secondReadback = true
+                }
+                // 成功缩进格子的顶：若已学值高于本次实测帧，该已学值就是错的，
+                // 当场纠正（只忘不学：错维记 0、当未知处理，AX 真下限仍会挡住）。
+                if !(w.frame.width > v.slot.width + 1.5 || w.frame.height > v.slot.height + 1.5) {
+                    if var cur = learnedMinSizes[w.appName] {
+                        let old = cur
+                        var changed = false
+                        if cur.width > 1, cur.width > w.frame.width + 4 { cur.width = 0; changed = true }
+                        if cur.height > 1, cur.height > w.frame.height + 4 { cur.height = 0; changed = true }
+                        if changed {
+                            if cur.width <= 0, cur.height <= 0 { learnedMinSizes.removeValue(forKey: w.appName) } else { learnedMinSizes[w.appName] = cur }
+                            saveLearnedMinSizes()
+                            log("min-size corrected: \(w.appName) \(Int(old.width))x\(Int(old.height)) -> \(Int(cur.width))x\(Int(cur.height)) (shrank to \(Int(w.frame.width))x\(Int(w.frame.height)))")
+                        }
+                    }
+                    if secondReadback {
+                        log("diag: \(w.appName) axMin=\(fmtAxMin(axMinSize(w.element))) write=\(fmtFrame(v.slot)) readback0.2s=\(fmtFrame(w0.frame)) readback1s=\(fmtFrame(w.frame)) result=placed")
+                    }
+                    continue
+                }
+                // 到这里一定是二次读回仍超格（一次读回即缩进的已在上面 continue）。
+                // 留存优先于退避：用户打开窗真拒缩不折回 Dock，改为浮着留存——
+                // 记当前帧为已落点、删掉当轮摆位（0.5 秒补写不得把它写回格子帧）。
+                if userOpenedKeys.contains(k) {
+                    oneShotKeeps[k] = w.frame
+                    userFloatedKeys.insert(k)
+                    oneShotPlacements.removeAll { winKey($0.win) == k }
+                    log("diag: \(w.appName) axMin=\(fmtAxMin(axMinSize(w.element))) write=\(fmtFrame(v.slot)) readback0.2s=\(fmtFrame(w0.frame)) readback1s=\(fmtFrame(w.frame)) result=floated")
+                    log("user opened floated: \(w.appName) keeps \(fmtFrame(w.frame)) (refused slot \(fmtFrame(v.slot)))")
+                    continue
+                }
+                // 失败记忆：同一窗口集合下折叠失败过的不再每轮重试，
+                // 只在集合变化（签名不同）时再试，避免失败窗每 2 秒重触发整轮。
+                if let failSig = foldFailedKeys[k], failSig == liveSig {
+                    log("diag: \(w.appName) axMin=\(fmtAxMin(axMinSize(w.element))) write=\(fmtFrame(v.slot)) readback0.2s=\(fmtFrame(w0.frame)) readback1s=\(fmtFrame(w.frame)) result=refused")
+                    continue
+                }
+                if hideFoldedWindow(w) {
+                    foldedKeys.insert(k)
+                    foldedScreenByKey[k] = v.sid
+                    foldFailedKeys.removeValue(forKey: k)
+                    oneShotFolds.append(OneShotFold(win: w, sid: v.sid, need: effectiveMin(for: w), slot: v.slot))
+                    log("fold (refused): \(w.appName) still \(Int(w.frame.width))x\(Int(w.frame.height)) > slot \(Int(v.slot.width))x\(Int(v.slot.height))")
+                    log("diag: \(w.appName) axMin=\(fmtAxMin(axMinSize(w.element))) write=\(fmtFrame(v.slot)) readback0.2s=\(fmtFrame(w0.frame)) readback1s=\(fmtFrame(w.frame)) result=refused")
+                } else {
+                    foldFailedKeys[k] = liveSig
+                    log("fold refused failed: \(w.appName), left visible for fallback")
+                    log("diag: \(w.appName) axMin=\(fmtAxMin(axMinSize(w.element))) write=\(fmtFrame(v.slot)) readback0.2s=\(fmtFrame(w0.frame)) readback1s=\(fmtFrame(w.frame)) result=refused")
+                }
+            }
+        }
+        for (key, frame) in oneShotKeeps { lastPlacedFrames[key] = frame }
+        for top in oneShotRaiseTops {
+            // 本轮已折叠的顶不得再提：AXRaise 会把刚最小化的窗恢复可见，
+            // 折叠当轮即蒸发、次轮原样重算——这是循环的直接恢复者。
+            // 已最小化的顶同样不提（防任何路径的折叠被提回）。
+            let tk = winKey(top)
+            if foldedKeys.contains(tk) { continue }
+            if boolAttr(top.element, kAXMinimizedAttribute as CFString) { continue }
+            AXUIElementPerformAction(top.element, kAXRaiseAction as CFString)
+        }
+        for screen in oneShotFocusCaptions {
+            showFocusCaption(on: screen, frame: focusFrame(on: screen))
+        }
+        // 补写不过滤已落位窗：冻结窗的帧由冻结布局定，补写只保护本轮新落点的窗。
+        oneShotLastPlacements = oneShotPlacements.filter { !foldedKeys.contains(winKey($0.win)) && !oneShotFrozenKeys.contains(winKey($0.win)) }
+        if source == "switch" {
+            log("oneshot switch applied: placed=\(written) folded=\(oneShotFolds.count) kept=\(oneShotKeeps.count)")
+        } else {
+            log("oneshot retile applied: placed=\(written) folded=\(oneShotFolds.count) kept=\(oneShotKeeps.count) skipped=\(skipped) source=\(source)")
+        }
+        refreshGrips()
+        refreshDotHandles()
+        refreshStackMarkers()
+        refreshDimLayers()
+        refreshHighlights()
+    }
+
+    /// 0.5 秒补写：不重算、只重写上一轮方案里仍偏离目标帧的窗。
+    /// 格数、格子、顶的归属全部沿用上一轮方案一次定死的结果，不并格、不换顶、不重解；
+    /// 集合变化时 tick 的签名门会挡住本函数（调用方已判签名一致才进）。
+    func reapplyOneShotPlan() {
+        guard AXIsProcessTrusted(), !stageManagerPaused else { return }
+        let live = collectWindows()
+        var written = 0
+        for p in oneShotLastPlacements {
+            let key = winKey(p.win)
+            guard let w = live.first(where: { winKey($0) == key }) else { continue }
+            if frameMatchesSlot(w.frame, pane: p.frame) { continue }
+            hardenPaneFrame(w.element, p.frame)
+            lastPlacedFrames[key] = p.frame
+            written += 1
+        }
+        if written > 0 {
+            log("oneshot reapply: wrote=\(written)")
+        }
+    }
+
+    /// 换布局一shot入口：算阶段（tileAll oneShot）+ 写阶段（一次写完）。
+    /// 写阶段只写方案：帧直接写（hardenPaneFrame，不读回、不重解、不因单窗
+    /// 失败重算整轮）；折叠执行沿用 v0.1.1 最小化验证；焦点 / Pin 超格窗不写
+    /// 不折，只把快照帧记为已落点（tick 不会把它弹回旧格）；最后各栈顶各提一次。
+    func applyLayoutSwitchOneShot() {
+        guard AXIsProcessTrusted() else {
+            log("oneshot switch skipped: not trusted")
+            return
+        }
+        guard !stageManagerPaused else {
+            log("oneshot switch skipped: Stage Manager paused")
+            return
+        }
+        oneShotFreshScreens.insert(screenID(activeScreen()))
+        // 模式切换 / 上限变化是重算触发：全部用户打开窗的留存期到此为止，
+        // 本轮即按尺寸适配规则重算（能缩进格就缩，缩不进按通用规则处理）。
+        userOpenedKeys.removeAll()
+        userFloatedKeys.removeAll()
+        // 切族/改上限是真实变化：失败记忆到此为止，本轮可再试折叠。
+        foldFailedKeys.removeAll()
+        runOneShot(source: "switch")
+    }
+
+    func tileAll(windowsByScreen: [CGDirectDisplayID: [WinInfo]]? = nil, oneShot: Bool = false) {
         // C2：Stage Manager 暂停时连 0.5 秒补铺也不执行
         guard !stageManagerPaused else { return }
         // 防重入：重排中又有重排请求时只记 pending，当前这轮结束后补跑一次，
@@ -4245,11 +4645,30 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         tilingInProgress = true
+        if oneShot {
+            // 一shot算阶段的缓冲：tile() 的求解段只往里记方案，不写 AX；
+            // 写阶段由 applyLayoutSwitchOneShot 在 tileAll 返回后统一执行。
+            oneShotActive = true
+            oneShotPlacements = []
+            oneShotFolds = []
+            oneShotKeeps = [:]
+            oneShotRaiseTops = []
+            oneShotFocusCaptions = []
+            oneShotVerifyTops = []
+            oneShotFrozenKeys = []
+        }
         defer {
             tilingInProgress = false
+            oneShotActive = false
             if tileAllPending {
                 tileAllPending = false
-                DispatchQueue.main.async { [weak self] in self?.forceTile() }
+                if oneShot {
+                    // 切换本身不产生第二轮：算阶段不写 AX，没有任何嵌套重排可挂起；
+                    // 万一有挂起请求也直接丢弃并记日志，不排异步 forceTile。
+                    log("oneshot: pending re-tile dropped, switch applies once")
+                } else {
+                    DispatchQueue.main.async { [weak self] in self?.forceTile() }
+                }
             }
         }
         axMinCache.removeAll()  // 每次求解重新查 AX 最小值，缓存只活一轮
@@ -4258,6 +4677,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let screens = NSScreen.screens
         let liveIDs = Set(screens.map(screenID))
         lastTilesByScreen = lastTilesByScreen.filter { liveIDs.contains($0.key) }
+        frozenLayoutByScreen = frozenLayoutByScreen.filter { liveIDs.contains($0.key) }
         lastVFByScreen = lastVFByScreen.filter { liveIDs.contains($0.key) }
         lastScreenFrameByScreen = lastScreenFrameByScreen.filter { liveIDs.contains($0.key) }
         lastActiveTileByScreen = lastActiveTileByScreen.filter { liveIDs.contains($0.key) }
@@ -4437,7 +4857,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 4. 输出：格子（显示顺序）、每格顶、帧、降格原因（nil 表示未降格）。
     /// 注意：被盖住的成员不验算；固定尺寸顶的格子按其精确尺寸给（topFitsSlot 内分支）。
     /// 调用方在显示顺序上跑本函数（displayStacks），stackTops 写回时按 permSrcSlot 换算回计算格下标。
-    func solveTopFit(stacks inStacks: [[WinInfo]], tops inTops: [WinInfo?], screen: NSScreen, sid: CGDirectDisplayID) -> (stacks: [[WinInfo]], tops: [WinInfo?], frames: [CGRect], reduceNote: String?) {
+    func solveTopFit(stacks inStacks: [[WinInfo]], tops inTops: [WinInfo?], screen: NSScreen, sid: CGDirectDisplayID, openedKeys: Set<String> = []) -> (stacks: [[WinInfo]], tops: [WinInfo?], frames: [CGRect], reduceNote: String?) {
         let vf = screen.visibleFrame
         var stacks = inStacks
         var tops = inTops
@@ -4465,6 +4885,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             var badTile: Int? = nil
             for i in stacks.indices {
                 guard let t = tops[i] else { badTile = i; break }
+                // 用户打开顶：本轮不动它（不换顶、不并格），下一触发再适配。
+                if openedKeys.contains(winKey(t)) { continue }
                 if !topFitsSlot(t, frames[i]) { badTile = i; break }
             }
             guard let bad = badTile else {
@@ -4596,6 +5018,143 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         log("when-full float -> \(w.appName)")
     }
 
+    // 已落位冻结重建（只在非换布局轮次调用）：不重解、不并格、不改格子帧。
+    // 输入冻结布局（计算格顺序）与本轮 live 窗，输出显示顺序的叠 + 帧 + 顶，
+    // 与 solveTopFit 同构，可直接替其输出。
+    // 规则：已落位窗回原格原位（关掉的留空格子）；新窗进空格（无可见成员的格），
+    // 无空格叠进活动格（当轮 whenFull 为浮动时改浮动）；Dock 点开的窗只算它自己
+    // （同规则进空格或叠栈，顶优先）；顶选择：用户打开窗 > stackTops > 记录顶键
+    // > 首位未折叠成员。选定后写回 stackTops，使提窗与 lastTiles 的顶口径一致。
+    func frozenSolve(screen: NSScreen, sid: CGDirectDisplayID, windows: [WinInfo], frozen: FrozenLayout, activeTopKey: String) -> (stacks: [[WinInfo]], tops: [WinInfo?], frames: [CGRect], reduceNote: String?) {
+        let tileCount = frozen.tileFrames.count
+        guard tileCount > 0, frozen.assignment.count == tileCount else { return ([[]], [nil], [], nil) }
+        let st = layoutSettings(for: screen)
+        var byKey: [String: WinInfo] = [:]
+        for w in windows { byKey[winKey(w)] = w }
+        let assignedKeys = Set(frozen.assignment.flatMap { $0 })
+        // 计算格叠：按冻结归属回填 live 窗（关掉的自然脱落，格子留空）。
+        var computeStacks: [[WinInfo]] = frozen.assignment.map { keys in keys.compactMap { byKey[$0] } }
+        // 本轮冻结窗键（供 0.5 秒补写过滤）；新落点的窗不在此列，补写仍保护它。
+        var frozenKeysThisRound: Set<String> = []
+        for stack in computeStacks { for w in stack { frozenKeysThisRound.insert(winKey(w)) } }
+        oneShotFrozenKeys.formUnion(frozenKeysThisRound)
+        // 活动格：含前台窗的格 > 含原活动顶的格 > 首个有可见成员的格 > 0。
+        func activeTileIndex() -> Int {
+            if let front = frontFocusKeyForPass, !front.isEmpty, let i = computeStacks.firstIndex(where: { $0.contains { winKey($0) == front && !foldedKeys.contains(winKey($0)) } }) { return i }
+            if !activeTopKey.isEmpty, let i = computeStacks.firstIndex(where: { $0.contains { winKey($0) == activeTopKey } }) { return i }
+            if let i = computeStacks.firstIndex(where: { $0.contains { !foldedKeys.contains(winKey($0)) } }) { return i }
+            return 0
+        }
+        // 新窗（不在冻结归属里：新开、切 Space 后首次见、Dock 点开后原格被占等）
+        // 只算它自己：有空格进空格，无空格叠进活动格（whenFull 为浮动时改浮动）。
+        var floatedFresh = false
+        for w in windows where !assignedKeys.contains(winKey(w)) {
+            let key = winKey(w)
+            // 空格 = 无 live 可见成员（只剩折叠成员的格也算空格：折叠窗不可见，
+            // 它日后点开回原格时与新窗同叠、顶优先用户打开窗）。
+            if let empty = computeStacks.firstIndex(where: { stack in
+                !stack.contains { m in !foldedKeys.contains(winKey(m)) }
+            }) {
+                computeStacks[empty].append(w)
+                if key == frontFocusKeyForPass {
+                    stackTops[stackTopKey(sid, empty)] = computeStacks[empty].count - 1
+                }
+            } else if st.whenFull == .float {
+                // 满格浮动：与 computeTiles 的 whenFullOverflow 同口径（只在选了
+                // 居中浮动时浮动；叠栈设置下走下面的叠栈分支）。
+                let step = floatedKeys.count
+                floatedKeys.insert(key)
+                if oneShotActive {
+                    oneShotPlacements.append(OneShotPlacement(win: w, frame: oneShotFloatFrame(w, on: screen, step: step)))
+                } else {
+                    floatWhenFull(w, on: screen)
+                }
+                floatedFresh = true
+            } else {
+                let ai = activeTileIndex()
+                computeStacks[ai].append(w)
+                if key == frontFocusKeyForPass {
+                    stackTops[stackTopKey(sid, ai)] = computeStacks[ai].count - 1
+                }
+            }
+        }
+        if floatedFresh {
+            showToast("This Space is full", detail: "⌘-drag a window onto a pane to swap.", on: screen)
+        }
+        // Primary 镜像（applyPrimarySwap 的计算格版）：冻结轮次跳过了
+        // 原调用，这里补做，否则 Primary 换顶在冻结轮次失效。
+        if let pk = primaryKeysByScreen[sid] {
+            if let pkTile = computeStacks.firstIndex(where: { $0.contains { winKey($0) == pk } }) {
+                let pkIdx = computeStacks[pkTile].firstIndex(where: { winKey($0) == pk })!
+                if pkTile == 0 {
+                    stackTops[stackTopKey(sid, 0)] = pkIdx
+                } else {
+                    let top0Idx = min(stackTops[stackTopKey(sid, 0)] ?? 0, computeStacks[0].count - 1)
+                    if computeStacks[0].indices.contains(top0Idx) {
+                        let b = computeStacks[0][top0Idx]
+                        computeStacks[0][top0Idx] = computeStacks[pkTile][pkIdx]
+                        computeStacks[pkTile][pkIdx] = b
+                        stackTops[stackTopKey(sid, 0)] = top0Idx
+                        stackTops[stackTopKey(sid, pkTile)] = pkIdx
+                    }
+                }
+            } else {
+                primaryKeysByScreen.removeValue(forKey: sid)
+            }
+        }
+        // 显示顺序：经当前置换（冻结格数口径）翻译。
+        let perm = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: tileCount)
+        let displayStacks = perm.map { computeStacks[$0] }
+        let displayFrames = perm.map { frozen.tileFrames[$0] }
+        // 顶选择（显示顺序）：用户打开窗 > stackTops（计算格键）>
+        // 记录顶键 > 首位未折叠成员 > 首位；选定后写回 stackTops。
+        var tops: [WinInfo?] = []
+        for di in displayStacks.indices {
+            let stack = displayStacks[di]
+            guard !stack.isEmpty else { tops.append(nil); continue }
+            let ci = perm[di]
+            var chosen: WinInfo? = nil
+            var chosenIdx = 0
+            if let g = stack.first(where: { userOpenedKeys.contains(winKey($0)) }) {
+                chosen = g
+                chosenIdx = stack.firstIndex(where: { winKey($0) == winKey(g) }) ?? 0
+            } else if let cur = stackTops[stackTopKey(sid, ci)], stack.indices.contains(cur),
+                      !foldedKeys.contains(winKey(stack[cur])) {
+                chosen = stack[cur]
+                chosenIdx = cur
+            } else if ci < frozen.topKeys.count, let rk = frozen.topKeys[ci],
+                      let idx = stack.firstIndex(where: { winKey($0) == rk }) {
+                chosen = stack[idx]
+                chosenIdx = idx
+            } else if let alt = stack.first(where: { !foldedKeys.contains(winKey($0)) }) {
+                chosen = alt
+                chosenIdx = stack.firstIndex(where: { winKey($0) == winKey(alt) }) ?? 0
+            } else {
+                chosen = stack[0]
+                chosenIdx = 0
+            }
+            tops.append(chosen)
+            stackTops[stackTopKey(sid, ci)] = chosenIdx
+        }
+        return (displayStacks, tops, displayFrames, nil)
+    }
+
+    // 拖缝后冻结记录跟帧：拖缝直接改帧不走 tile()，冻结记录须跟着拖后的帧走，
+    // 否则下次事件触发冻结轮次会把拖过的窗写回拖前帧。按成员键认格
+    // （shown 顺序与计算格顺序未必一致，空位格不动）；撤销时同样跟回拖前帧。
+    func syncFrozenFramesFromShownTiles(sid: CGDirectDisplayID) {
+        guard var frozen = frozenLayoutByScreen[sid], let tiles = lastTilesByScreen[sid] else { return }
+        for t in tiles {
+            let keys = Set(t.stack.map { winKey($0) })
+            guard !keys.isEmpty else { continue }
+            if let ci = frozen.assignment.firstIndex(where: { !Set($0).isDisjoint(with: keys) }),
+               frozen.tileFrames.indices.contains(ci) {
+                frozen.tileFrames[ci] = t.frame
+            }
+        }
+        frozenLayoutByScreen[sid] = frozen
+    }
+
     func tile(screen: NSScreen, windows: [WinInfo], refreshOverlays: Bool = true) {
         let sid = screenID(screen)
         let st = layoutSettings(for: screen)
@@ -4610,6 +5169,14 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let fk = focusKey, focusScreen == sid {
             if let fw = windows.first(where: { winKey($0) == fk }) {
                 let full = focusFrame(on: screen)
+                if oneShotActive {
+                    // 一shot算阶段：Focus 窗只记方案（精确帧 = focusFrame），不写 AX；
+                    // 写阶段统一写帧并补专注提示。
+                    oneShotPlacements.append(OneShotPlacement(win: fw, frame: full))
+                    oneShotFocusCaptions.append(screen)
+                    if refreshOverlays { hideGrips(); hideStackMarkers(); hideHighlights(); removeDimLayers() }
+                    return
+                }
                 AXUIElementPerformAction(fw.element, kAXRaiseAction as CFString)
                 placeFrame(fw.element, full, key: fk, animated: draggingDividerID == nil)
                 lastPlacedFrames[fk] = full
@@ -4638,10 +5205,57 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 关掉/移走的窗口从「并进堆叠」名单里清掉，同键的新窗口要重新验算。
         // 盖邻格去抖记录同理裁剪：已关窗口的旧键若被新窗口复用，不得误去抖。
         let liveKeys = Set(windows.map { winKey($0) })
+        // 切换族/上限从头重算：上一布局的求解态（活动格、超格成员-only 标记、
+        // 栈顶、格子置换）不带进新族；手动堆叠（stackedOnto）与 Primary 是
+        // 用户态，不是上一布局的残留，保留。格子帧本身每轮重算，不复用。
+        let freshSwitch = oneShotFreshScreens.contains(sid)
+        if freshSwitch {
+            oversizeStacked.subtract(liveKeys)
+            lastActiveTileByScreen.removeValue(forKey: sid)
+            stackTops = stackTops.filter { !$0.key.hasPrefix("\(sid):") }
+            pinnedTops = pinnedTops.filter { !$0.key.hasPrefix("\(sid):") }
+            tileSwapPermByScreen.removeValue(forKey: sid)
+        }
+        // 已落位冻结判定：非换布局轮次、本屏有冻结布局、格数一致、
+        // 且全部冻结帧仍在当前可视区内（1.5pt 容差）。任一条件不满足
+        // 即走全量重算（并在 tile 末尾重新记录）。
+        let frozenLayoutForRound = frozenLayoutByScreen[sid]
+        let frozenFramesValid: Bool = {
+            guard let f = frozenLayoutForRound, !f.tileFrames.isEmpty, f.tileFrames.count == f.assignment.count else { return false }
+            return f.tileFrames.allSatisfy { fr in
+                fr.minX >= vf.minX - 1.5 && fr.maxX <= vf.maxX + 1.5 &&
+                fr.minY >= vf.minY - 1.5 && fr.maxY <= vf.maxY + 1.5
+            }
+        }()
+        let isFrozenRound = !freshSwitch && frozenFramesValid
         oversizeStacked.formIntersection(liveKeys)
         oversizeHost = oversizeHost.filter { oversizeStacked.contains($0.key) }
         coverLoggedFrame = coverLoggedFrame.filter { liveKeys.contains($0.key) }
         let sig = signature(windows)
+        // 恢复后可见的折叠窗：Dock 点出 / 激活恢复后它已不在最小化态，
+        // 但折叠记账还留着——先清账，再按正常窗走本轮求解（本轮即重算触发，
+        // 尺寸适配规则直接适用；不合尺寸的在这里就会折，而不是留到下一轮）。
+        // 注意：仍最小化的折叠窗不在此列（仍藏在 Dock 里，继续按折叠处理）。
+        for w in windows where foldedKeys.contains(winKey(w)) {
+            if !boolAttr(w.element, kAXMinimizedAttribute as CFString) {
+                let k = winKey(w)
+                foldedKeys.remove(k)
+                foldedMinimizedKeys.remove(k)
+                foldedElements.removeValue(forKey: k)
+                foldedScreenByKey.removeValue(forKey: k)
+            }
+        }
+        // 用户亲手最小化：留存期到此为止，且不得自动恢复（恢复块只动
+        // 折叠集成员，留存窗不在折叠集里，天然不恢复）。屏幕集合变化、
+        // 焦点切换、其他窗开/关一律不得清掉留存态——旧宽限“签名一变
+        // 即清”的逻辑已删，留存只在这里、切族/改上限、窗关闭时清掉。
+        for w in windows where userOpenedKeys.contains(winKey(w)) {
+            if boolAttr(w.element, kAXMinimizedAttribute as CFString) {
+                userOpenedKeys.remove(winKey(w))
+                userFloatedKeys.remove(winKey(w))
+                log("user opened cleared: \(w.appName) minimized by user")
+            }
+        }
         let previousTiles = lastTilesByScreen[sid] ?? []
         let previousKeys = Set(previousTiles.flatMap { $0.stack.map { winKey($0) } })
         var preservedTopKeys: [String] = []
@@ -4649,33 +5263,56 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if signatureChanged {
             let fresh = windows.reduce(0) { $0 + (previousKeys.contains(winKey($1)) ? 0 : 1) }
             notePlaced(fresh)
-            for tile in previousTiles where !tile.stack.isEmpty {
+            for tile in previousTiles where !tile.stack.isEmpty && !freshSwitch {
                 // 三元组自带显示顶，置换下也正确；不再按格下标反查 stackTops。
+                // 从头重算时跳过：上一布局的顶不得带进新族。
                 preservedTopKeys.append(winKey(tile.top))
             }
             // 下标会随关窗错位，按窗口键在新堆叠里再找回来；不要把每一叠都清成 0。
-            stackTops = stackTops.filter { !$0.key.hasPrefix("\(sid):") }
-            pinnedTops = pinnedTops.filter { !$0.key.hasPrefix("\(sid):") }
+            // 冻结轮次不清除栈顶/固定顶：冻结重建靠 stackTops 认顶，清掉会丢
+            // 用户翻过的栈顶；签名基线照常更新（tick 门仍工作）。
+            if !isFrozenRound {
+                stackTops = stackTops.filter { !$0.key.hasPrefix("\(sid):") }
+                pinnedTops = pinnedTops.filter { !$0.key.hasPrefix("\(sid):") }
+            }
             lastTiledSignatureByScreen[sid] = sig
         }
         // 先拆掉上一轮的自动堆叠，再按当前最小尺寸决定要不要重新并进去。
         // 手动堆叠不在 autoStackHost 里，不会被拆。
         let previousAuto = autoStackHost
-        if draggingDividerID == nil, dragState == nil {
+        // 冻结轮次不拆自动堆叠：冻结归属里已含自动堆叠关系，拆掉后
+        // 本轮不再重推（planTileFit 已跳过），会丢归属。
+        if draggingDividerID == nil, dragState == nil, !isFrozenRound {
             releaseAutoStacks(on: sid, live: windows)
         }
         var (stacks, origActive, whenFullOverflow) = computeTiles(windows: windows, st: st, sid: sid)
         // 满格且选了居中浮动：多出来的根窗口立刻浮动，不进任何叠。
         var floatedNewWindow = false
-        for w in whenFullOverflow where !floatedKeys.contains(winKey(w)) {
+        // 冻结轮次跳过满格浮动：computeTiles 的溢出是按重算分布算的，
+        // 冻结轮次里满格新窗由 frozenSolve 按当轮 whenFull 定（叠栈或浮动）。
+        for w in whenFullOverflow where !isFrozenRound && !floatedKeys.contains(winKey(w)) {
             if !previousKeys.contains(winKey(w)) { floatedNewWindow = true }
-            floatWhenFull(w, on: screen)
+            if oneShotActive {
+                // 一shot算阶段：满格浮动窗只记方案（纯计算落点），不写 AX；
+                // 浮动记账（floatedKeys）是方案状态，算阶段即可写入。
+                let step = floatedKeys.count
+                floatedKeys.insert(winKey(w))
+                oneShotPlacements.append(OneShotPlacement(win: w, frame: oneShotFloatFrame(w, on: screen, step: step)))
+            } else {
+                floatWhenFull(w, on: screen)
+            }
         }
         if floatedNewWindow {
             showToast("This Space is full", detail: "⌘-drag a window onto a pane to swap.", on: screen)
         }
-        stacks = applyPrimarySwap(stacks: stacks, sid: sid)
-        if draggingDividerID == nil, dragState == nil, !stacks.isEmpty {
+        // 冻结轮次跳过 Primary 交换：输入叠是重算的旧分布，在其上交换
+        // 会写错栈顶；Primary 由 frozenSolve 内按计算格镜像处理。
+        if !isFrozenRound {
+            stacks = applyPrimarySwap(stacks: stacks, sid: sid)
+        }
+        // 冻结轮次跳过约束重推：本轮叠分布由 frozenSolve 从冻结归属重建，
+        // 这里按重算分布推 planTileFit 只会写错栈顶与自动堆叠关系。
+        if draggingDividerID == nil, dragState == nil, !stacks.isEmpty, !isFrozenRound {
             let activeIdx = min(origActive, stacks.count - 1)
             let activeStack = stacks[activeIdx]
             let activeTop = activeStack[min(stackTops[stackTopKey(sid, activeIdx)] ?? 0, activeStack.count - 1)]
@@ -4805,7 +5442,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let activeTopKey = stacks.isEmpty ? "" : winKey(stacks[min(origActive, stacks.count - 1)][min(stackTops[stackTopKey(sid, min(origActive, stacks.count - 1))] ?? 0, stacks[min(origActive, stacks.count - 1)].count - 1)])
         let fitStacks = stacks
         let active = fitStacks.firstIndex(where: { $0.contains(where: { winKey($0) == activeTopKey }) }) ?? 0
-        if signatureChanged {
+        // 冻结轮次跳过顶恢复：fitStacks 是重算分布，其下标与冻结格错位，
+        // 按它写 stackTops 会错指；冻结轮次的顶由 frozenSolve 定。
+        if signatureChanged && !isFrozenRound {
             for (i, stack) in fitStacks.enumerated() {
                 if let key = preservedTopKeys.first(where: { k in stack.contains { winKey($0) == k } }),
                    let idx = stack.firstIndex(where: { winKey($0) == key }) {
@@ -4819,7 +5458,12 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     for (i, stack) in fitStacks.enumerated() {
                         if let idx = stack.firstIndex(where: { winKey($0) == fk }) {
                             stackTops[stackTopKey(sid, i)] = idx
-                            AXUIElementPerformAction(windows[fi].element, kAXRaiseAction as CFString)
+                            if oneShotActive {
+                                // 一shot算阶段不提窗：记到写阶段统一提一次。
+                                oneShotRaiseTops.append(windows[fi])
+                            } else {
+                                AXUIElementPerformAction(windows[fi].element, kAXRaiseAction as CFString)
+                            }
                         }
                     }
                 }
@@ -4839,6 +5483,13 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 栈顶下标按计算格存，随叠走；求解并格后置换失效（格数变了），直接清掉置换、按显示格存。
         let swapPerm = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: fitStacks.count)
         if swapPerm == Array(0..<fitStacks.count) { tileSwapPermByScreen.removeValue(forKey: sid) } else { tileSwapPermByScreen[sid] = swapPerm }
+        // 冻结轮次：置换按冻结格数重新消毒（fitStacks 数随开窗/关窗变，
+        // 冻结格数不变；旧置换若按旧数存会错指），供冻结重建与下游
+        // permSrcSlot 共用同一口径。
+        if isFrozenRound, let f = frozenLayoutByScreen[sid] {
+            let fp = sanitizedSwapPerm(tileSwapPermByScreen[sid], count: f.tileFrames.count)
+            if fp == Array(0..<f.tileFrames.count) { tileSwapPermByScreen.removeValue(forKey: sid) } else { tileSwapPermByScreen[sid] = fp }
+        }
         var displayStacks = swapPerm.map { fitStacks[$0] }
         var displayActive = displayStacks.firstIndex(where: { $0.contains(where: { winKey($0) == activeTopKey }) }) ?? active
         // 求解 provisional 顶：沿用计算格栈顶（经 permSrcSlot 换算），跳过成员-only 标记；
@@ -4847,14 +5498,24 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 否则折叠窗的最小尺寸会把格子撑大，显示顶反而填不满）。
         let provisionalTops: [WinInfo?] = displayStacks.indices.map { di in
             let stack = displayStacks[di]
+            // 用户打开窗优先当顶：点开后要正常展示，不能被求解换成成员藏起来。
+            if let g = stack.first(where: { userOpenedKeys.contains(winKey($0)) }) { return g }
             let ci = permSrcSlot(di, sid: sid)
             let cur = stackTops[stackTopKey(sid, ci)] ?? 0
             if stack.indices.contains(cur), !oversizeStacked.contains(winKey(stack[cur])), !foldedKeys.contains(winKey(stack[cur])) { return stack[cur] }
             if let alt = stack.first(where: { !oversizeStacked.contains(winKey($0)) && !foldedKeys.contains(winKey($0)) }) { return alt }
             return stack.first
         }
-        let solved = solveTopFit(stacks: displayStacks, tops: provisionalTops, screen: screen, sid: sid)
-        let didMerge = solved.stacks.count != displayStacks.count
+        // 已落位冻结：非换布局轮次且本屏冻结布局有效时，不重解——只按冻结归属
+        // 与新窗规则重建方案（frozenSolve），已落位窗的格子、帧、栈归属一律不动；
+        // 换布局或几何失效时走正常求解并重新记录冻结布局（见 tile 末尾）。
+        let solved: (stacks: [[WinInfo]], tops: [WinInfo?], frames: [CGRect], reduceNote: String?)
+        if isFrozenRound, let frozen = frozenLayoutByScreen[sid] {
+            solved = frozenSolve(screen: screen, sid: sid, windows: windows, frozen: frozen, activeTopKey: activeTopKey)
+        } else {
+            solved = solveTopFit(stacks: displayStacks, tops: provisionalTops, screen: screen, sid: sid, openedKeys: userOpenedKeys)
+        }
+        let didMerge = isFrozenRound ? false : solved.stacks.count != displayStacks.count
         displayStacks = solved.stacks
         let frames = solved.frames
         if didMerge {
@@ -4862,18 +5523,48 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // 置换清掉后计算格下标全部重排，旧 pin 会错指别的格，并格时一并清掉（重钉只需再点一次芯片）。
             pinnedTops = pinnedTops.filter { !$0.key.hasPrefix("\(sid):") }
         }
-        // 自动折叠：任一轴最小尺寸超格子的窗折叠到 Dock（不摆位、不盖邻格）。
-        // 折叠不改变所属格与堆叠顺序，只是一个状态旗标；解除只由 Dock 恢复/
-        // 激活恢复/焦点取消折叠触发，格子尺寸变化不自动解折（避免布局一变就弹回盖邻格）。
+        // 尺寸适配（两步）：格子两维都 ≥ 窗的最小尺寸 → 缩到格子帧置入
+        // （摆位循环里写尺寸 + 位置）；任一维 < 最小尺寸 → 折进 Dock。
+        // 焦点窗与非焦点窗同一规则（昨日“焦点窗绝不折”已作废）。
+        // 折叠不改变所属格与堆叠顺序，只是一个状态旗标；解除只由 Dock 恢复 /
+        // 激活恢复触发，格子尺寸变化不自动解折（避免布局一变就弹回盖邻格）。
         // 名义格帧（等分基线）：min 门只判真超格，让位后的小格不触发误折。
-        let nominalFrames = nominalTileFrames(count: displayStacks.count, screen: screen)
+        // 冻结轮次：名义格帧即冻结帧（按显示格数等分会算错：关窗留空
+        // 的格子不占 shown 叠数，等分基线与冻结几何不一致）。
+        let nominalFrames = isFrozenRound ? frames : nominalTileFrames(count: displayStacks.count, screen: screen)
         for (i, stack) in displayStacks.enumerated() {
             let slot = frames.indices.contains(i) ? frames[i] : vf
             let nominalSlot = nominalFrames.indices.contains(i) ? nominalFrames[i] : slot
-            // 几何不稳定期不折（瞬态几何不触发连锁折叠）；焦点窗与固定窗不折。
-            guard geometryStable() else { continue }
-            for w in stack where winKey(w) != frontFocusKeyForPass && !pinnedWindowKeys.contains(winKey(w)) && isFoldOversize(w, slot: nominalSlot) {
+            // 几何不稳定期不折（瞬态几何不触发连锁折叠），但超格窗记入
+            // 推迟集、稳定后由 tick 补折，不再静默丢失；固定窗不折；
+            // 用户打开窗在留存期内不折（留存只在切族/改上限、关窗、
+            // 用户亲手最小化时清掉）。
+            if !geometryStable() {
+                // 用户打开窗不进推迟集（留存机制自己管它，推迟集留着只会误触发）。
+                // 一shot 模式也不进推迟集：先试缩流程下，超格与否由写后读回定，
+                // 推迟集只会让 deferredFoldDue 在稳定后误触发 forceTile。
+                for w in stack where !oneShotActive && !pinnedWindowKeys.contains(winKey(w)) && !userOpenedKeys.contains(winKey(w)) && isFoldOversize(w, slot: nominalSlot) {
+                    let k = winKey(w)
+                    if deferredFoldKeys.insert(k).inserted {
+                        log("fold deferred: \(w.appName) (geometry unstable, retry when stable)")
+                    }
+                }
+                continue
+            }
+            // 推迟集清账：已不超格、已留存、已固定的窗不再是推迟对象，
+            // 否则稳定后 tick 会反复误触发 forceTile。
+            for w in stack where pinnedWindowKeys.contains(winKey(w)) || userOpenedKeys.contains(winKey(w)) || !isFoldOversize(w, slot: nominalSlot) {
+                deferredFoldKeys.remove(winKey(w))
+            }
+            for w in stack where !pinnedWindowKeys.contains(winKey(w)) && !userOpenedKeys.contains(winKey(w)) && isFoldOversize(w, slot: nominalSlot) {
                 let k = winKey(w)
+                if oneShotActive {
+                    // 一shot算阶段：不再凭最小尺寸在写前判折叠。已学最小尺寸
+                    // 可能不准（快照帧、旧版本学值、AX 未报），写前判折会把能缩
+                    // 的窗也折掉。先试缩流程：本轮只记摆位，写后读回一次，
+                    // 真拒缩才由写阶段复核定为 Dock（见 applyOneShotPlan）。
+                    continue
+                }
                 // 先藏再记：最小化失败不进折叠集（fail-safe），仍按旧守卫处理。
                 guard hideFoldedWindow(w) else { continue }
                 if !foldedKeys.contains(k) {
@@ -4884,7 +5575,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         // 每格显示顶：第一个未折叠成员（从求解顶起循环找）；整格全折时回退首位（仅记账，不摆位）。
-        let displayTopIdx: [Int] = displayStacks.indices.map { i in
+        // 预检（焦点扩格、两两复核）会折叠捐格并拨动显示顶，故为 var。
+        var displayTopIdx: [Int] = displayStacks.indices.map { i in
             let stack = displayStacks[i]
             guard !stack.isEmpty else { return 0 }
             let start = (solved.tops.indices.contains(i) ? solved.tops[i] : nil).flatMap { t in
@@ -4895,6 +5587,97 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if !foldedKeys.contains(winKey(stack[idx])) { return idx }
             }
             return 0
+        }
+        // 一shot算阶段收尾：互不重叠校验（纯计算，不写 AX）。
+        // 可见帧只算各格显示顶：栈内非顶成员共用格帧、只露顶，算遮挡不算
+        // 重叠，不进校验；Float 居中帧、Focus 功能铺满帧是用户主动的覆盖态，
+        // Pin 保留帧与用户打开帧是已批准的豁免，只记日志、不折邻格。
+        // effFrames 恒等于求解帧（焦点扩格已拆，不再有扩格帧）。
+        let effFrames = frames
+        if oneShotActive {
+            // 本轮可见顶：从显示顶起循环找第一个未折叠成员；整格全折则无可见顶。
+            func visibleTopIndex(_ stack: [WinInfo], start: Int) -> Int? {
+                guard !stack.isEmpty else { return nil }
+                for off in 0..<stack.count {
+                    let idx = (start + off) % stack.count
+                    if !foldedKeys.contains(winKey(stack[idx])) { return idx }
+                }
+                return nil
+            }
+            // 折一格全部未折叠成员（调用方保证全部可折：非 Pin），
+            // 并把显示顶拨到首个剩余未折叠成员；整格全折时回退首位（仅记账）。
+            func foldWholeStack(_ j: Int, slot: CGRect, why: String) {
+                guard displayStacks.indices.contains(j) else { return }
+                for m in displayStacks[j] where !foldedKeys.contains(winKey(m)) {
+                    let need = effectiveMin(for: m)
+                    oneShotFolds.append(OneShotFold(win: m, sid: sid, need: need, slot: slot))
+                    foldedKeys.insert(winKey(m))
+                    foldedScreenByKey[winKey(m)] = sid
+                }
+                if let nt = visibleTopIndex(displayStacks[j], start: 0) {
+                    displayTopIdx[j] = nt
+                } else if displayStacks[j].indices.contains(0) {
+                    displayTopIdx[j] = 0
+                }
+                log("oneshot overlap resolved: \(why)")
+            }
+            // 一格是否可整格折掉：有未折叠成员、且全部非 Pin
+            // （焦点窗与非焦点窗同一规则，焦点不再豁免）。
+            func foldableStack(_ j: Int) -> Bool {
+                guard displayStacks.indices.contains(j) else { return false }
+                let members = displayStacks[j].filter { !foldedKeys.contains(winKey($0)) }
+                return !members.isEmpty && members.allSatisfy { !pinnedWindowKeys.contains(winKey($0)) }
+            }
+            // 焦点窗与非焦点窗同一规则：焦点窗不再靠扩格、压邻格、
+            // 折邻格或盖邻格留在屏上；超格即按尺寸适配规则折进 Dock。
+            // （昨日焦点硬约束机器已拆：压邻格 / 折邻格 / 清同带 /
+            //  焦点格扩格 effFrames 全部删除，effFrames 恒等于求解帧。）
+            // 两两复核（安全网）：可见顶之间不得相交。格子帧本身互不相
+            // 交，正常情况零相交；残留相交时折后者整格（全部可折才折），
+            // 含 Pin 保留帧或用户打开帧的相交只记日志（不折邻格迁就它）。
+            struct VisibleEntry { let idx: Int; let key: String; let frame: CGRect; let pinKeep: Bool; let openedKeep: Bool }
+            var visible: [VisibleEntry] = []
+            for j in displayStacks.indices {
+                guard let ti = visibleTopIndex(displayStacks[j], start: displayTopIdx.indices.contains(j) ? displayTopIdx[j] : 0) else { continue }
+                let top = displayStacks[j][ti]
+                let key = winKey(top)
+                let nominal = nominalFrames.indices.contains(j) ? nominalFrames[j] : vf
+                let pinKeep = pinnedWindowKeys.contains(key) && isFoldOversize(top, slot: nominal)
+                let openedKeep = userOpenedKeys.contains(key)
+                let frame = (pinKeep || openedKeep) ? top.frame : (effFrames.indices.contains(j) ? effFrames[j] : vf)
+                visible.append(VisibleEntry(idx: j, key: key, frame: frame, pinKeep: pinKeep, openedKeep: openedKeep))
+                // Pin 成员保留帧：Pin 成员超格时也按快照帧保留，同样是可见窗，
+                // 与邻格相交时只记日志（Pin 豁免），不折。
+                for m in displayStacks[j] where winKey(m) != key && pinnedWindowKeys.contains(winKey(m)) && isFoldOversize(m, slot: nominal) {
+                    visible.append(VisibleEntry(idx: j, key: winKey(m), frame: m.frame, pinKeep: true, openedKeep: false))
+                }
+            }
+            for a in visible.indices {
+                for b in visible.indices where b > a {
+                    let ea = visible[a], eb = visible[b]
+                    // 同格的顶与成员共用一格、只露顶，算遮挡不算重叠，不复核。
+                    guard ea.idx != eb.idx else { continue }
+                    // 本轮已折空的格不再参与复核（快照已旧）。
+                    guard !displayStacks[ea.idx].allSatisfy({ foldedKeys.contains(winKey($0)) }),
+                          !displayStacks[eb.idx].allSatisfy({ foldedKeys.contains(winKey($0)) }) else { continue }
+                    guard differentPanesIntersect(ea.frame, eb.frame) else { continue }
+                    if ea.openedKeep || eb.openedKeep {
+                        log("oneshot overlap kept: user opened covers (\(ea.key) vs \(eb.key))")
+                        continue
+                    }
+                    if ea.pinKeep || eb.pinKeep {
+                        log("oneshot overlap kept: pin covers (\(ea.key) vs \(eb.key))")
+                        continue
+                    }
+                    if foldableStack(eb.idx) {
+                        foldWholeStack(eb.idx, slot: eb.frame, why: "pairwise overlap, later tile folded")
+                    } else if foldableStack(ea.idx) {
+                        foldWholeStack(ea.idx, slot: ea.frame, why: "pairwise overlap, earlier tile folded")
+                    } else {
+                        log("oneshot overlap kept: no foldable tile (\(ea.key) vs \(eb.key))")
+                    }
+                }
+            }
         }
         // 顶下标写回计算格（并格后置换已清，显示格即计算格）；写回的是显示顶（未折叠），
         // 故后续 lastTilesByScreen 的顶与摆位提顶读到的都是显示顶。
@@ -4914,21 +5697,35 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             lastSolvedCountByScreen[sid] = displayStacks.count
         }
         let animateMoves = draggingDividerID == nil
-        lastPanesByScreen[sid] = displayStacks.indices.map { frames.indices.contains($0) ? frames[$0] : vf }
+        lastPanesByScreen[sid] = displayStacks.indices.map { effFrames.indices.contains($0) ? effFrames[$0] : vf }
         var placedStacks: [[WinInfo]] = Array(repeating: [], count: displayStacks.count)
         for (i, stack) in displayStacks.enumerated() {
-            let slot = frames.indices.contains(i) ? frames[i] : vf
+            let slot = effFrames.indices.contains(i) ? effFrames[i] : vf
             for w in stack {
                 let key = winKey(w)
+                if oneShotActive, foldedKeys.contains(key) {
+                    if pinnedWindowKeys.contains(key) {
+                        // 一shot算阶段：已固定的折叠窗解除折叠记账，落到下面的
+                        // 正常方案（Pin 豁免在上），不写 AX。焦点窗不再享受
+                        // 此待遇（焦点与非焦点同一规则）；恢复后可见的折叠窗
+                        // 已在求解开头清过账，不会走到这里。
+                        foldedKeys.remove(key)
+                        foldedMinimizedKeys.remove(key)
+                        foldedElements.removeValue(forKey: key)
+                    } else {
+                        // 已折叠 / 本轮新定的折叠：算阶段不摆位，写阶段统一执行。
+                        placedStacks[i].append(w)
+                        continue
+                    }
+                }
                 if foldedKeys.contains(key) {
                     // 折叠窗不摆位：真窗口最小化隐藏；仍保留在叠里（翻堆顺序不动）。
                     // 最小化失败（或被系统恢复可见后又拒绝再藏）时 fail-safe：撤出折叠集、
                     // 落到下面的普通摆位，旧守卫（demote / member-only）继续处理它；
                     // 绝不出现“以为折了、窗还看得见”。
-                    if key == frontFocusKeyForPass || pinnedWindowKeys.contains(key) {
-                        // 焦点/固定取消折叠：用户正在用它（Dock 恢复/激活恢复未拦截到的
-                        // 情况），或它已被固定，不再重新最小化；恢复可见后按正常摆位，
-                        // 焦点离开且未固定时再按正常门处理。
+                    if pinnedWindowKeys.contains(key) {
+                        // 固定取消折叠：它已被固定，不再重新最小化；恢复可见后按正常摆位。
+                        // 焦点窗不再享受此待遇（焦点与非焦点同一规则）。
                         if unminimizeFoldedWindow(element: w.element, key: key) {
                             foldedKeys.remove(key)
                             foldedMinimizedKeys.remove(key)
@@ -4948,6 +5745,46 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         log("fold minimize failed: \(w.appName), unfolded for fallback")
                     }
                 }
+                if oneShotActive {
+                    // 一shot算阶段：只记方案，不写 AX。用户打开浮着窗与 Pin 超格窗
+                    // 不写不折，只记快照帧为已落点（写阶段记入 lastPlacedFrames，
+                    // tick 不弹回）；留存窗先走正常摆位试缩，真拒缩才由写阶段
+                    // 复核记浮着；其余窗记目标格帧，写阶段按稳定顺序一次写完。
+                    // 尺寸适配两步：格子两维 ≥ 最小尺寸即缩到格子帧置入（本行），
+                    // 任一维 < 最小尺寸的已在折叠循环里定为 Dock，不会走到这里。
+                    let nominal = nominalFrames.indices.contains(i) ? nominalFrames[i] : slot
+                    if userFloatedKeys.contains(key) {
+                        oneShotKeeps[key] = w.frame
+                        placedStacks[i].append(w)
+                        continue
+                    }
+                    if pinnedWindowKeys.contains(key) && isFoldOversize(w, slot: nominal) {
+                        oneShotKeeps[key] = w.frame
+                        placedStacks[i].append(w)
+                        continue
+                    }
+                    oneShotPlacements.append(OneShotPlacement(win: w, frame: slot))
+                    // 写阶段 AX 拒缩复核只验显示顶：本窗是本格显示顶才记入。
+                    if displayTopIdx.indices.contains(i), stack.indices.contains(displayTopIdx[i]),
+                       winKey(stack[displayTopIdx[i]]) == key {
+                        oneShotVerifyTops.append(OneShotVerifyTop(win: w, slot: slot, sid: sid))
+                    }
+                    placedStacks[i].append(w)
+                    continue
+                }
+                // 用户打开浮着窗：非一shot 路径也不写帧（浮着留存）。
+                if userFloatedKeys.contains(key) {
+                    lastPlacedFrames[key] = w.frame
+                    placedStacks[i].append(w)
+                    continue
+                }
+                // 已落位冻结窗：非一shot 路径也不重写（冻结帧即落点；当前帧
+                // 记为已落点，tick 不弹回）。一shot 路径由写阶段 frameMatchesSlot 跳过。
+                if isFrozenWindowKey(key) {
+                    lastPlacedFrames[key] = w.frame
+                    placedStacks[i].append(w)
+                    continue
+                }
                 // 最小尺寸再大也写入这一格。AX 若拒绝缩小，harden 会再写几次。
                 let preSize = getSize(w.element)
                 placeFrame(w.element, slot, key: key, animated: animateMoves, learnName: w.appName, preSize: preSize, slot: slot, minSize: .zero)
@@ -4958,9 +5795,19 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let shownStacks = placedStacks.enumerated().filter { !$0.element.isEmpty }
         // 摆完一叠后把栈顶提到最前：写帧时系统可能把刚动过的成员提到前面，
         // 不显式提一次的话，用户看到的是压在格子外面的大窗口，而不是铺满格子的那扇。
-        for (i, stack) in displayStacks.enumerated() where stack.count > 1 {
-            let topIndex = min(stackTops[stackTopKey(sid, permSrcSlot(i, sid: sid))] ?? 0, stack.count - 1)
-            AXUIElementPerformAction(stack[max(0, topIndex)].element, kAXRaiseAction as CFString)
+        if oneShotActive {
+            // 一shot算阶段不提窗：各栈顶记到写阶段统一提一次。
+            for (i, stack) in displayStacks.enumerated() {
+                let topIndex = min(stackTops[stackTopKey(sid, permSrcSlot(i, sid: sid))] ?? 0, stack.count - 1)
+                if stack.indices.contains(max(0, topIndex)) {
+                    oneShotRaiseTops.append(stack[max(0, topIndex)])
+                }
+            }
+        } else {
+            for (i, stack) in displayStacks.enumerated() where stack.count > 1 {
+                let topIndex = min(stackTops[stackTopKey(sid, permSrcSlot(i, sid: sid))] ?? 0, stack.count - 1)
+                AXUIElementPerformAction(stack[max(0, topIndex)].element, kAXRaiseAction as CFString)
+            }
         }
         // AX 拒绝缩到格子里的窗口：布局时求解循环已按顶验证（调份额/并格/成员-only），落点后仍不精确一致的
         // 由落定复核（demote）与 tick 守卫按“卡住”记标记、触发重算，不留在格子里违规、不盖住邻格。
@@ -4972,7 +5819,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let s = pair.element
             let topIndex = min(stackTops[stackTopKey(sid, permSrcSlot(pair.offset, sid: sid))] ?? 0, s.count - 1)
             let top = s[max(0, topIndex)]
-            let shown = inFlightFrame(key: winKey(top)) ?? (frames.indices.contains(pair.offset) ? frames[pair.offset] : vf)
+            let shown = oneShotActive
+                ? (oneShotKeeps[winKey(top)] ?? (effFrames.indices.contains(pair.offset) ? effFrames[pair.offset] : vf))
+                : (inFlightFrame(key: winKey(top)) ?? (frames.indices.contains(pair.offset) ? frames[pair.offset] : vf))
             return (stack: s, frame: shown, top: top)
         }
         if refreshOverlays {
@@ -4990,10 +5839,38 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !dragQuiet {
             log("tiled screen=\(screenName(screen)) \(windows.count) windows limit=\(st.tileLimit) saved=\(globalSettings.tileLimit) tiles=\(displayStacks.count) active=\(displayActive) \(tileDesc)")
         }
+        // 已落位冻结记录：本轮终态（显示顺序）翻回计算格顺序存档。
+        // 全量轮次重算几何+归属；冻结轮次几何不变、只更新归属
+        // （新窗进格/关窗留空/点开回格都由此沉淀，下轮不再重算）。
+        // Focus/清屏提前返回的轮次不到这里，不动旧记录。
+        do {
+            var computeFrames: [CGRect] = Array(repeating: vf, count: displayStacks.count)
+            var computeAssignment: [[String]] = Array(repeating: [], count: displayStacks.count)
+            var computeTopKeys: [String?] = Array(repeating: nil, count: displayStacks.count)
+            for di in displayStacks.indices {
+                let ci = permSrcSlot(di, sid: sid)
+                if computeFrames.indices.contains(ci) {
+                    computeFrames[ci] = effFrames.indices.contains(di) ? effFrames[di] : vf
+                    computeAssignment[ci] = displayStacks[di].map { winKey($0) }
+                    if displayTopIdx.indices.contains(di), displayStacks[di].indices.contains(displayTopIdx[di]) {
+                        computeTopKeys[ci] = winKey(displayStacks[di][displayTopIdx[di]])
+                    }
+                }
+            }
+            // 置换已清（并格）时 permSrcSlot 即恒等，存档与显示顺序一致。
+            frozenLayoutByScreen[sid] = FrozenLayout(tileFrames: computeFrames, assignment: computeAssignment, topKeys: computeTopKeys)
+        }
         // 自动可见性路径已删：tile 末尾只剩落定复核（transient 守卫），不再有独占→浮动转换分发。
-        demoteOverflowingStackTops()
+        // 一shot算阶段跳过落定复核与 z 序归一化：两者都读实时帧 / 写 AX 并可能异步
+        // 触发下一轮重算，会破坏“切换写完即停”；写阶段统一提栈顶一次。
+        if !oneShotActive {
+            demoteOverflowingStackTops()
+        }
         // z 序归一化：格顶一律高于成员（见 normalizeTopZOrder），覆盖求解/摆位/换顶后经 forceTile 的一切路径。
-        normalizeTopZOrder(sid: sid)
+        // 一shot算阶段跳过（见上）；写阶段统一提栈顶一次。
+        if !oneShotActive {
+            normalizeTopZOrder(sid: sid)
+        }
     }
 
     // 弹簧落定后复核每叠栈顶：应用拒绝缩小的成员会顶在格子外面，横着盖住邻格。
@@ -5037,7 +5914,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 guard !foldedKeys.contains(winKey(top)) else { continue }
                 // 焦点顶不复核：焦点规则——正在用的窗不 demote、不折叠，焦点离开后再正常处理。
                 // 固定顶同豁免：固定期间不 demote、不折叠，取消固定后再正常处理。
-                if winKey(top) == frontFocusKeyForPass || pinnedWindowKeys.contains(winKey(top)) { continue }
+                // 用户打开顶与已落位冻结顶同豁免：留存/冻结窗不 demote、不折叠。
+                if winKey(top) == frontFocusKeyForPass || pinnedWindowKeys.contains(winKey(top)) || userOpenedKeys.contains(winKey(top)) || isFrozenWindowKey(winKey(top)) { continue }
                 if let pin = pinnedTops[key] {
                     if stack.contains(where: { winKey($0) == pin }) { continue }
                     pinnedTops.removeValue(forKey: key)
@@ -5190,6 +6068,32 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return layoutFrames(count: count, vf: screen.visibleFrame, kind: st.kind, share: 0.5, gap: st.gap)
     }
 
+    /// 几何不稳定期推迟的折叠是否已可补：稳定、且仍有推迟窗可见并超格。
+    /// 顺带裁剪已不存在 / 已折叠 / 已不超格的推迟键，避免误触发。
+    /// 注意不用 geometryStable()（它在不稳定期记节流日志，这里只是复核，不记）。
+    func deferredFoldDue(windows: [WinInfo]) -> Bool {
+        guard Date().timeIntervalSince(geometryChangedAt) >= 2.0, !deferredFoldKeys.isEmpty else { return false }
+        var due = false
+        for key in Array(deferredFoldKeys) {
+            guard let w = windows.first(where: { winKey($0) == key }), !foldedKeys.contains(key),
+                  !pinnedWindowKeys.contains(key), !userOpenedKeys.contains(key) else {
+                deferredFoldKeys.remove(key)
+                continue
+            }
+            let sid = screenID(screenForFrame(w.frame))
+            guard let screen = NSScreen.screens.first(where: { screenID($0) == sid }),
+                  let tiles = lastTilesByScreen[sid],
+                  let idx = tiles.firstIndex(where: { $0.stack.contains { winKey($0) == key } }) else { continue }
+            let nominal = nominalTileFrames(count: tiles.count, screen: screen)
+            guard nominal.indices.contains(idx), isFoldOversize(w, slot: nominal[idx]) else {
+                deferredFoldKeys.remove(key)
+                continue
+            }
+            due = true
+        }
+        return due
+    }
+
     /// 几何稳定：任一屏可视区/屏帧变化后 2 秒内不折叠（显示切换瞬态几何不触发连锁折叠）。
     /// 节流日志：不稳定期间每秒最多记一次，避免洪水刷屏。
     func geometryStable() -> Bool {
@@ -5206,8 +6110,20 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func scheduleScreenChangeRetile() {
         screenChangeRetileTimer?.invalidate()
         screenChangeRetileTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-            self?.screenChangeRetileTimer = nil
-            self?.forceTile()
+            guard let self = self else { return }
+            self.screenChangeRetileTimer = nil
+            // 屏幕通知是放大器不是根因：无真实变化时不重排，否则每轮写帧
+            // 激起的通知会 0.5 秒后又触发 forceTile，绕过 tick 签名门。
+            // 真实变化 = 窗口集合签名变，或任一屏可视区/屏帧变（Dock 显隐
+            // 只改可视区不改窗口数，也必须重排）。
+            let sigChanged = self.fullSignature() != self.lastSignature
+            var geoChanged = false
+            for s in NSScreen.screens {
+                let sid = self.screenID(s)
+                if let prevVF = self.lastVFByScreen[sid], prevVF != s.visibleFrame { geoChanged = true }
+                if let prevF = self.lastScreenFrameByScreen[sid], prevF != s.frame { geoChanged = true }
+            }
+            if sigChanged || geoChanged { self.forceTile() }
         }
     }
 
@@ -5225,7 +6141,7 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// 返回 true = 确实藏起来了；false = 最小化失败，调用方不得将其置入 foldedKeys
     /// （fail-safe：求解器绝不能以为折了、窗还看得见；失败窗仍按旧守卫处理）。
     /// 已最小化的窗不再重复写（Dock 动画只跑一次）；用户亲手从 Dock 恢复的折叠窗，
-    /// 下一轮仍会被重新最小化（焦点窗与固定窗除外：焦点取消折叠与固定豁免会先接手）。
+    /// 留存期内不重折（固定窗豁免同理；留存只在切族/改上限、窗关闭、用户亲手最小化时清掉）。
     /// 旧屏外停放已删：系统会挡回屏外位置却写进尺寸（800x600 的块堆在格子原点），
     /// 求解器以为折走、现实还在屏上，模型一脱节布局就炸掉——最小化是唯一可靠的隐藏。
     func hideFoldedWindow(_ w: WinInfo) -> Bool {
@@ -6267,6 +7183,8 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             lastTilesByScreen[sid] = tiles
             if screenID(activeScreen()) == sid { lastTiles = tiles }
+            // 撤销后冻结记录也要回拖前帧，否则下次冻结轮次写回拖中帧。
+            syncFrozenFramesFromShownTiles(sid: sid)
             if let v = snap.splitOverrideValue {
                 splitOverrides[snap.splitOverrideKey] = v
             } else {
@@ -6373,6 +7291,9 @@ final class TileProtoApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             ? (clamped - vf.minX) / max(vf.width, 1)
             : (clamped - vf.minY) / max(vf.height, 1)
         splitOverrides["\(sid)-\(globalSettings.kind.rawValue)-\(tiles.count)-\(dividerID)"] = frac
+        // 拖缝直接改帧不走 tile()：冻结记录跟拖后的帧走，否则下次事件
+        // 触发冻结轮次会把拖过的窗写回拖前帧。
+        syncFrozenFramesFromShownTiles(sid: sid)
         if let panel = gripPanels["\(sid)-\(dividerID)"] {
             if vertical {
                 panel.setFrameOrigin(NSPoint(x: clamped - panel.frame.width / 2, y: panel.frame.minY))
@@ -8945,9 +9866,9 @@ private func runTileProtoSelfTest() {
 
     let grid3 = layoutFrames(count: 3, vf: vf, kind: .grid, share: 0.5, gap: gap)
     tileProtoCheck(grid3.count == 3, "grid 3 count")
-    tileProtoCheck(grid3[0].height > grid3[1].height + 1 && grid3[0].height > grid3[2].height + 1, "grid 3 left is the tall pane")
-    tileProtoCheck(grid3[0].width * grid3[0].height > grid3[1].width * grid3[1].height, "grid 3 left area")
-    tileProtoCheck(grid3[0].width * grid3[0].height > grid3[2].width * grid3[2].height, "grid 3 left area vs second small")
+    tileProtoCheck(abs(grid3[0].width - grid3[1].width) < 0.6 && abs(grid3[0].height - grid3[1].height) < 0.6, "grid 3 top row is two equal cells")
+    tileProtoCheck(abs(grid3[2].width - grid3[0].width) < 0.6 && abs(grid3[2].height - grid3[0].height) < 0.6, "grid 3 bottom-left matches the top cells")
+    tileProtoCheck(grid3[0].minX == grid3[2].minX && grid3[0].minY > grid3[2].maxY, "grid 3 left column stacks top over bottom")
 
     let cols = layoutFrames(count: 3, vf: vf, kind: .columns, share: 0.5, gap: gap)
     tileProtoCheck(cols.count == 3, "columns 3 count")
@@ -9183,7 +10104,7 @@ private func runTileProtoSelfTest() {
     }
     let macGrid3 = layoutFrames(count: 3, vf: mac, kind: .grid, share: 0.5, gap: macGap)
     let macSide3 = layoutFrames(count: 3, vf: mac, kind: .side, share: 0.5, gap: macGap)
-    tileProtoCheck(macGrid3 == macSide3, "grid 3 and side 3 share one shape")
+    tileProtoCheck(macGrid3 != macSide3, "grid 3 differs from side 3")
     let macGrid4 = layoutFrames(count: 4, vf: mac, kind: .grid, share: 0.5, gap: macGap)
     tileProtoCheck(macGrid4 != macSide3, "grid 4 is not the side shape")
     var walkLimit = 3
@@ -9278,12 +10199,12 @@ private func runTileProtoSelfTest() {
     let macCols = layoutFrames(count: 3, vf: mac, kind: .columns, share: 0.5, gap: macGap)
     tileProtoCheck(macGrid.count == 3 && macCols.count == 3, "macbook count 3 frames")
     tileProtoCheck(abs(macGrid[0].width - macCols[0].width) > 20, "grid 3 is not three equal columns")
-    tileProtoCheck(macGrid[0].height > macGrid[1].height + 1, "grid 3 keeps one tall pane")
+    tileProtoCheck(abs(macGrid[0].height - macGrid[1].height) < 0.6 && abs(macGrid[0].width - macGrid[2].width) < 0.6, "grid 3 is a 2x2 grid, not one tall pane")
     let macSide = layoutFrames(count: 3, vf: mac, kind: .side, share: 2.0 / 3.0, gap: macGap)
     tileProtoCheck(macSide[0].width > macSide[1].width + 100, "two-thirds widens the side primary")
 
     tileProtoCheck(layoutCaption(kind: .side, count: 3) == "Side · One big, two beside", "side 3 caption")
-    tileProtoCheck(layoutCaption(kind: .grid, count: 3) == "Grid · One big, two small", "grid 3 caption")
+    tileProtoCheck(layoutCaption(kind: .grid, count: 3) == "Grid · Two by two, three filled", "grid 3 caption")
     tileProtoCheck(layoutCaption(kind: .columns, count: 3) == "Columns · Three columns", "columns 3 caption")
     tileProtoCheck(layoutCaption(kind: .grid, count: 4) == "Grid · Grid of four", "grid 4 caption")
     tileProtoCheck(layoutCaption(kind: .side, count: 4) == "Side · One big, three beside", "side 4 caption")
@@ -9315,6 +10236,23 @@ private func runTileProtoSelfTest() {
     tileProtoCheck(springPeak > 1.15 && springPeak < 1.17, "spring overshoots by about 0.16")
     tileProtoCheck(abs(tileSpringDuration - 0.62) < 0.001, "spring duration is 0.62s")
     tileProtoCheck(abs(hoverShowDelay - 0.15) < 0.001 && abs(hoverArmDelay - 0.40) < 0.001 && abs(hoverHideDelay - 0.35) < 0.001, "hover timings")
+
+    // 退化分支也不得让格子重叠：剩余空间不足时均分贴边，哪怕格子小于最小尺寸。
+    func framesDisjoint(_ frames: [CGRect]) -> Bool {
+        for a in frames.indices {
+            for b in frames.indices where b > a {
+                if differentPanesIntersect(frames[a], frames[b]) { return false }
+            }
+        }
+        return true
+    }
+    let tiny = CGRect(x: 0, y: 0, width: 20, height: 20)
+    tileProtoCheck(framesDisjoint(layoutFrames(count: 3, vf: tiny, kind: .columns, share: 0.5, gap: gap)), "tiny columns stay disjoint")
+    tileProtoCheck(framesDisjoint(layoutFrames(count: 3, vf: tiny, kind: .rows, share: 0.5, gap: gap)), "tiny rows stay disjoint")
+    tileProtoCheck(framesDisjoint(layoutFrames(count: 3, vf: tiny, kind: .side, share: 0.5, gap: gap)), "tiny side stays disjoint")
+    tileProtoCheck(framesDisjoint(layoutFrames(count: 3, vf: tiny, kind: .grid, share: 0.5, gap: gap)), "tiny grid 3 stays disjoint")
+    tileProtoCheck(framesDisjoint(layoutFrames(count: 4, vf: tiny, kind: .grid, share: 0.5, gap: gap)), "tiny grid 4 stays disjoint")
+    tileProtoCheck(layoutFrames(count: 3, vf: tiny, kind: .columns, share: 0.5, gap: gap).count == 3, "tiny columns still yield 3 cells")
 
     fputs("SELFTEST OK\n", stdout)
     exit(0)
